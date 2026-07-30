@@ -8,3 +8,7 @@
   close-on-exec fd duplication, prepared/claimed lease ownership, and RAII
   cleanup.
 - Reserve EGL and Vulkan integrations for optional features in the same crate.
+- Add explicit caller-owned/transferred issue results, atomic drain waiters,
+  normalized retry errors, and optional single-flight exponential release retry.
+- Add frame-level retain and ownership-aware consumer/session protocols with
+  consuming open, transfer, and close helpers.

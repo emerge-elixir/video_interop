@@ -1,6 +1,7 @@
 # Library-Owned Video Lifecycle and Emerge Integration
 
-Status: approved architecture; implementation pending.
+Status: Phase 1 generic ownership/consumer foundation implemented; independent
+review and downstream phases remain.
 
 This plan supersedes the application-owned `PrimeBridge` and `PrimeRenderer`
 approach in `/workspace/emerge_demo`. It refines Phase 2 and the consumer side of

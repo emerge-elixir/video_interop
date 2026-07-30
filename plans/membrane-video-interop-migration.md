@@ -1,8 +1,7 @@
 # Membrane Video Interop Migration
 
-Status: base transport adapter implemented in
-`/workspace/membrane_video_interop`; reusable consumer sink, generic foundation
-hardening, and consumer migration remain.
+Status: base transport adapter and generic ownership/consumer hardening
+implemented; reusable consumer sink and downstream migration remain.
 
 ## Goal
 

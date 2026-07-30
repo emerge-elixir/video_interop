@@ -73,8 +73,8 @@ format = %Format{
 :ok = VideoInterop.validate(frame, format)
 ```
 
-Timestamps belong to the transport carrying the frame. A future
-`membrane_video_interop` package can place `%VideoInterop.Frame{}` in a
+Timestamps belong to the transport carrying the frame. The separate
+`membrane_video_interop` package places `%VideoInterop.Frame{}` in a
 `Membrane.Buffer` without making this package depend on Membrane.
 
 ## Ownership
@@ -93,10 +93,61 @@ A native consumer must:
 
 `VideoInterop.LeaseOwner` makes release idempotent per `{token, holder}`, uses
 confirmed issuance and fan-out retention, and drains holders after producer
-shutdown. Calling `LeaseOwner.issue/3` transfers the backend token to the owner,
-which releases it even when capacity, draining, timeout, or caller death rejects
-the issue. A holder must never be copied to another consumer; use
-`VideoInterop.Lease.retain/2` to create a unique child holder.
+shutdown. Issue errors state ownership explicitly:
+
+```elixir
+case LeaseOwner.issue(owner, backend_token) do
+  {:ok, lease} ->
+    publish(lease)
+
+  {:error, {:caller_owned, reason}} ->
+    Producer.release(backend_token)
+    {:error, reason}
+
+  {:error, {:transferred, reason}} ->
+    {:error, reason}
+end
+```
+
+The send operation is the ownership boundary. Backend tokens also require an
+owner-crash/message-drop destructor fallback. A holder must never be copied to
+another consumer; use `VideoInterop.retain/2` to return the same frame with a
+unique child holder.
+
+`LeaseOwner.close/2` begins draining without waiting. `LeaseOwner.drain/2`
+registers a waiter atomically and returns only after all holders and final
+release callbacks complete. Optional single-flight exponential release retry is
+available for idempotent backend callbacks:
+
+```elixir
+release_retry:
+  {:exponential, initial_ms: 10, max_ms: 1_000, max_attempts: :infinity}
+```
+
+A failed final callback remains alive and retryable after producer death and
+after automatic retry exhaustion. The owner never terminates implicitly merely
+because no notification observer is alive; a producer that wants a fatal policy
+must configure and own that policy explicitly.
+
+### Consumer sessions
+
+Consumers implement `VideoInterop.Consumer` to open a format-specific session
+and `VideoInterop.ConsumerSession` to transfer and close frames. The transfer
+receipt identifies the holder owner at the return boundary. Applications use
+the consuming helper instead of branching on receipts themselves:
+
+```elixir
+{:ok, session} = VideoInterop.open_consumer(consumer, format, owner: self())
+:ok = VideoInterop.consume(session, frame)
+:ok = VideoInterop.close_consumer(session)
+```
+
+After `consume/2` returns normally, the caller never releases that frame. The
+helper releases known caller-owned rejection, while transferred frames retire
+inside the consumer. Session close is idempotent and stops admission before
+pending/current frames are retired or scheduled for consumer-safe retirement.
+A contract implementation that raises or returns an invalid receipt leaves
+ownership unknown, so the helper raises rather than risking a double release.
 
 ## Rust crate
 
@@ -135,8 +186,9 @@ Rustler's `OwnedEnv::send_and_clear` never runs on a BEAM scheduler thread.
 
 ## Migration plan
 
-See [`plans/membrane-video-interop-migration.md`](plans/membrane-video-interop-migration.md)
-for the coordinated `membrane_video_interop` and downstream consumer cutover.
+See the
+[`membrane_video_interop` migration plan](https://github.com/emerge-elixir/video_interop/blob/main/plans/membrane-video-interop-migration.md)
+for the coordinated adapter and downstream consumer cutover.
 
 ## Planned optional features
 

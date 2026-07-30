@@ -1,7 +1,7 @@
 defmodule VideoInterop.FrameTest do
   use ExUnit.Case, async: true
 
-  alias VideoInterop.{Colorimetry, Format, Frame, Lease, Rect, SyncFile}
+  alias VideoInterop.{Colorimetry, Format, Frame, Lease, LeaseOwner, Rect, SyncFile}
   alias VideoInterop.DMABuf
   alias VideoInterop.DMABuf.{Descriptor, FourCC, Layer, Object, Plane}
 
@@ -39,6 +39,34 @@ defmodule VideoInterop.FrameTest do
 
     assert {:error, {:invalid_field, [:format, :colorimetry, :range], :bogus}} =
              VideoInterop.validate(%{format() | colorimetry: %Colorimetry{range: :bogus}})
+  end
+
+  test "retains a frame with identical data and a distinct holder" do
+    test_pid = self()
+
+    {:ok, owner} =
+      LeaseOwner.start_link(
+        producer: self(),
+        release: fn token ->
+          send(test_pid, {:backend_released, token})
+          :ok
+        end
+      )
+
+    assert {:ok, root} = LeaseOwner.issue(owner, :surface)
+    original = %{frame() | lease: root}
+    assert {:ok, child} = VideoInterop.retain(original)
+
+    assert %{child | lease: original.lease} == original
+    assert child.lease.owner == original.lease.owner
+    assert child.lease.token == original.lease.token
+    assert child.lease.holder != original.lease.holder
+
+    assert :ok = VideoInterop.release(original)
+    refute_receive {:backend_released, :surface}
+    assert :ok = VideoInterop.release(child)
+    assert_receive {:backend_released, :surface}
+    assert :ok = LeaseOwner.close(owner)
   end
 
   test "detects format mismatches" do
