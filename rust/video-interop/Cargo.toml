@@ -1,0 +1,28 @@
+[package]
+name = "video-interop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+description = "Owned video frame descriptors, synchronization, and optional Rustler integration"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/emerge-elixir/video_interop"
+documentation = "https://docs.rs/video-interop"
+keywords = ["video", "dmabuf", "drm", "rustler", "interop"]
+categories = ["api-bindings", "multimedia::video"]
+
+[lib]
+name = "video_interop"
+path = "src/lib.rs"
+
+[features]
+default = ["rustler"]
+rustler = ["dep:rustler"]
+
+[dependencies]
+libc = "0.2"
+rustler = { version = "0.38", optional = true }
+thiserror = "2"
+
+[package.metadata.docs.rs]
+all-features = true

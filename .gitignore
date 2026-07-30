@@ -1,0 +1,11 @@
+/_build/
+/deps/
+/doc/
+/cover/
+/.elixir_ls/
+/.pi-subagents/
+/priv/native/
+/target/
+video_interop-*.tar
+*.ez
+erl_crash.dump

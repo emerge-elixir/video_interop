@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  elixir:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "29"
+          elixir-version: "1.20"
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - run: mix deps.get
+      - run: mix format --check-formatted
+      - run: mix test
+      - run: mix hex.build
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace
+      - run: cargo test -p video-interop --no-default-features
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy -p video-interop --no-default-features --all-targets -- -D warnings
+      - run: cargo package -p video-interop --allow-dirty
