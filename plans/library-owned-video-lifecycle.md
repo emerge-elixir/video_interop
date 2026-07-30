@@ -546,11 +546,13 @@ Behavior:
 6. Demand again only after the ownership result is resolved.
 7. On transport or validation rejection, release any canonical embedded
    `%VideoInterop.Frame{}` exactly once before dropping/stopping.
-8. On EOS, orderly termination, or `on_error: :stop`, stop demand and close the
-   consumer session so its final displayed claim retires.
-9. On `on_error: :drop`, notify only after ownership resolution and demand the
-   next buffer.
-10. Never hold a frame between callbacks and never handle native retirement
+8. On `on_error: :stop`, close the consumer session, then enter terminal drain:
+   continue demanding and release every canonical frame without submission
+   until producer EOS. Terminate with the saved error only after EOS.
+9. On EOS, close the consumer session so its final displayed claim retires.
+10. On `on_error: :drop`, notify only after ownership resolution and demand the
+    next buffer.
+11. Never hold a frame between callbacks and never handle native retirement
     messages itself.
 
 With `notify_to: pid`, the sink sends:
@@ -577,13 +579,19 @@ release legacy `:dmabuf` terms.
 Do not add Emerge dependencies, a lease owner, descriptor structs, native code,
 or validation implementations to `membrane_video_interop`.
 
-The orderly sink contract does not claim that arbitrary `Process.exit(pid,
-:kill)` is recoverable in-VM: Membrane core may already hold a buffer term whose
-lease has no BEAM destructor. The Emerge consumer-session owner monitor can
-close already-transferred/current native claims, but it cannot recover a frame
-lost from an abruptly killed Membrane mailbox. Acceptance therefore covers
-orderly EOS/termination/restart and whole-VM cold restart. A future crash-safe
-admission custodian requires a separate acknowledged Membrane transport design.
+Membrane core may prefetch canonical buffers into a private input queue. A
+terminal frame or format error therefore does not terminate immediately: the
+sink re-demands and releases queued holders until producer EOS. Safe orderly
+shutdown is producer EOS -> sink terminal drain/EOS close -> pipeline
+termination.
+
+Arbitrary `Membrane.Pipeline.terminate/2` before EOS or `Process.exit(pid,
+:kill)` can discard a queued frame term whose lease has no BEAM destructor. The
+Emerge consumer-session owner monitor can close already-transferred/current
+native claims, but it cannot recover such a queued frame. Those operations are
+outside this unacknowledged transport contract; use the EOS sequence or a
+whole-VM cold restart. A future crash-safe admission custodian requires a
+separate acknowledged Membrane transport design.
 
 ## Implementation phases
 
@@ -692,9 +700,11 @@ Use fake consumer implementations plus a real `LeaseOwner` to prove:
 - legacy/dual metadata is rejected, never translated;
 - first-frame and error notifications happen after ownership resolution and
   contain no ownership responsibility;
-- EOS/orderly termination close the consumer session and retire its last claim;
-- no demand occurs after `on_error: :stop`;
-- sink shutdown has no internally held frame or queued holder.
+- EOS closes the consumer session and retires its last claim;
+- `on_error: :stop` re-demands/releases prefetched holders until EOS, then
+  terminates without a queued holder;
+- invalid-format rejection follows the same prefetched-holder drain;
+- external pipeline termination is invoked only after producer EOS.
 
 The Hex archive must still contain no Rust, Rustler, NIF, Emerge module,
 `LeaseOwner`, or duplicate generic schema.
@@ -968,7 +978,8 @@ On user-accessible DRM hardware validate:
 - target hidden/visible transitions and inactive-drop counters;
 - target destruction/recreation and direct reconnection;
 - consumer-first and producer-first shutdown with frames in flight;
-- orderly pipeline terminate/restart and viewport shutdown/restart;
+- producer EOS -> sink drain -> orderly pipeline terminate/restart, plus viewport
+  shutdown/restart;
 - whole-VM cold restart under load;
 - documented evidence that arbitrary in-VM `:kill` is outside the unacknowledged
   Membrane transport guarantee;
