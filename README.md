@@ -5,9 +5,9 @@ video frames across Elixir and native Rust code.
 
 The project publishes one Hex package (`video_interop`) and one Rust crate
 (`video-interop`) from the same repository. The Hex archive also includes the
-crate source. Core ownership, Rustler schema support, and future EGL/Vulkan
-adapters stay in that one crate; graphics API
-integrations are feature-gated rather than split into separate packages.
+crate source. Core ownership, Rustler schema support, and optional EGL/Vulkan
+adapters stay in that one crate; graphics API integrations are feature-gated
+rather than split into separate packages.
 
 Version 0.1 supports:
 
@@ -16,6 +16,8 @@ Version 0.1 supports:
 - DRM fourcc and explicit/implicit modifier metadata;
 - implicit acquire synchronization and borrowed Linux sync-file fences;
 - close-on-exec native fd duplication and RAII cleanup;
+- an optional dynamically loaded EGL native-fence adapter with no mandatory
+  EGL/GL linkage;
 - visible/coded frame geometry and generic format metadata;
 - deterministic BEAM leases with safe fan-out and draining;
 - exact optional Rustler encoding/decoding for frame, DMA-BUF, sync-file, and
@@ -190,12 +192,12 @@ See the
 [`membrane_video_interop` migration plan](https://github.com/emerge-elixir/video_interop/blob/main/plans/membrane-video-interop-migration.md)
 for the coordinated adapter and downstream consumer cutover.
 
-## Planned optional features
+## Optional graphics features
 
-EGL native-fence and Vulkan `SYNC_FD` semaphore adapters will be added as
-optional `egl` and `vulkan` features of the same `video-interop` crate. They will
-accept caller-owned displays, contexts, devices, and queues; the crate will not
-create rendering runtimes. Metal and Direct3D remain later work.
+The `egl` feature provides dynamically loaded native sync-file fence creation,
+import, bounded waits, duplication, and destruction without linking EGL or GL.
+It accepts a caller-owned current display/context and does not create a graphics
+runtime. Vulkan `SYNC_FD`, Metal, and Direct3D adapters remain later work.
 
 ## Validation
 
@@ -208,7 +210,9 @@ mix hex.build
 cargo fmt --all -- --check
 cargo test --workspace
 cargo test -p video-interop --no-default-features
+cargo test -p video-interop --no-default-features --features egl
 cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy -p video-interop --no-default-features --features egl --all-targets -- -D warnings
 ```
 
 ## License

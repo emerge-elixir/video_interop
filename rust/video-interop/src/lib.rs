@@ -1,6 +1,8 @@
 #![doc = include_str!("../README.md")]
 
 mod dmabuf;
+#[cfg(feature = "egl")]
+pub mod egl;
 mod error;
 mod fd;
 mod frame;

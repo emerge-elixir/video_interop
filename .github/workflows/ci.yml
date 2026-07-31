@@ -29,6 +29,8 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace
       - run: cargo test -p video-interop --no-default-features
+      - run: cargo test -p video-interop --no-default-features --features egl
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p video-interop --no-default-features --all-targets -- -D warnings
+      - run: cargo clippy -p video-interop --no-default-features --features egl --all-targets -- -D warnings
       - run: cargo package -p video-interop --allow-dirty

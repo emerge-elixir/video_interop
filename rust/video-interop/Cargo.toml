@@ -17,6 +17,7 @@ path = "src/lib.rs"
 
 [features]
 default = ["rustler"]
+egl = []
 rustler = ["dep:rustler"]
 
 [dependencies]

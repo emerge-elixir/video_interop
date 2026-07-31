@@ -475,7 +475,8 @@ Initial accepted frame shape is deliberately narrow and checked before claim:
 - supported alpha mode for the selected fourcc, with unsupported alpha rejected;
 - implicit or supported linear/per-buffer modifiers only under current importer
   capabilities;
-- `acquire_sync: :implicit` only until explicit EGL waits ship.
+- `acquire_sync: :implicit | %VideoInterop.SyncFile{}`; Emerge imports and waits
+  on sync files on the backend render thread before sampling.
 
 Every unsupported shape returns a caller-owned error and causes no import, wake,
 generation change, or redraw.
@@ -516,8 +517,8 @@ Required properties:
   every claim exactly once;
 - release delivery remains on the crate's dedicated native worker, never a BEAM
   scheduler thread;
-- explicit acquire fences are rejected as caller-owned until the EGL consumer
-  wait path is implemented.
+- explicit acquire fences are duplicated during preparation, transferred at
+  claim, and imported or bounded-waited by Emerge on the render thread.
 
 ## Reusable Membrane sink
 
@@ -753,7 +754,8 @@ Focused tests:
 - same-ID target replacement cannot be submitted to or removed by a stale
   resource;
 - submit racing renderer stop, retained target after stop, and registry closed;
-- implicit sync accepted and explicit sync rejected without claim;
+- implicit and explicit sync accepted, with explicit fd ownership transferred
+  only after claim;
 - inactive target rejection remains import/wake/redraw-free;
 - queue admission, replacement, consumer-stream close, registry removal,
   renderer shutdown, and context loss each release once;
@@ -912,8 +914,8 @@ boot—not by shipping both lease protocols in one deployment.
 
 ### Phase 8: explicit synchronization
 
-After canonical implicit-sync migration is stable, implement
-`active-headless-prime-explicit-sync.md`:
+The canonical direct path now implements
+`active-headless-prime-explicit-sync.md` (hardware validation remains pending):
 
 - producer exports an EGL native-fence sync file;
 - `%VideoInterop.SyncFile{}` carries it;

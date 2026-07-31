@@ -13,5 +13,7 @@ video-interop = { version = "0.1", default-features = false }
 ```
 
 Version 0.1 supports process-local Linux DMA-BUF descriptors and acquire
-sync-file fences. EGL and Vulkan adapters will be optional features of this same
-crate in later slices.
+sync-file fences. The optional `egl` feature provides dynamically loaded EGL
+native-fence capability, import/export, typed wait, and bounded poll helpers
+without a mandatory EGL/GL link dependency. Vulkan and future platform adapters
+remain optional features of this same crate.
