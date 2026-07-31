@@ -10,10 +10,26 @@ defmodule VideoInterop.MixProject do
       elixir: "~> 1.17",
       description: "Owned video frame descriptors, synchronization, and leases",
       elixirc_paths: elixirc_paths(Mix.env()),
+      aliases: aliases(),
       package: package(),
       docs: docs(),
       deps: deps()
     ]
+  end
+
+  defp aliases do
+    [test: [&test_without_schema_artifact/1]]
+  end
+
+  defp test_without_schema_artifact(args) do
+    try do
+      Mix.Tasks.Test.run(args)
+    after
+      [__DIR__, "priv", "native", "video_interop_schema_test.*"]
+      |> Path.join()
+      |> Path.wildcard()
+      |> Enum.each(&File.rm/1)
+    end
   end
 
   defp deps do
