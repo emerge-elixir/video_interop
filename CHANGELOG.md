@@ -12,3 +12,10 @@
   normalized retry errors, and optional single-flight exponential release retry.
 - Add frame-level retain and ownership-aware consumer/session protocols with
   consuming open, transfer, and close helpers.
+- Add prototype-gated per-holder abandonment guards, transactional root/retain
+  construction, bounded release tombstones, honest late-release diagnostics,
+  distinct fallback accounting, and immutable final drain stats.
+- Authenticate producer-native guards through authority envelopes, preserve
+  them opaquely through Rust prepare/claim, and replace the detached static
+  worker with explicitly closed/joined lifecycle dispatchers whose destructors
+  remain nonblocking.

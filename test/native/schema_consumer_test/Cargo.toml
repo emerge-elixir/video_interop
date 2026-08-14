@@ -1,0 +1,12 @@
+[package]
+name = "video_interop_schema_consumer_test"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rustler = "0.38"
+video-interop = { path = "../../../rust/video-interop" }

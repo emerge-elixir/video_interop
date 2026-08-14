@@ -19,8 +19,11 @@ path = "src/lib.rs"
 default = ["rustler"]
 egl = []
 rustler = ["dep:rustler"]
+test-support = ["rustler"]
+vulkan = ["dep:ash"]
 
 [dependencies]
+ash = { version = "0.38", default-features = false, features = ["std"], optional = true }
 libc = "0.2"
 rustler = { version = "0.38", optional = true }
 thiserror = "2"

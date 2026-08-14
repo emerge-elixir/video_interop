@@ -1,0 +1,125 @@
+#version 450
+
+// One invocation converts one 2x2 luma block. Camera's left/midpoint NV12 path shares the
+// complete six-sample chroma neighborhood across all four output pixels.
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform usamplerBuffer source_buffer;
+layout(set = 0, binding = 1, rgba8) writeonly uniform image2D output_image;
+
+layout(push_constant) uniform Parameters {
+    uint width;
+    uint height;
+    uint y_offset;
+    uint y_pitch;
+    uint uv_offset;
+    uint uv_pitch;
+    uint color_range;
+    uint x_chroma_offset;
+    uint y_chroma_offset;
+} params;
+
+uint load_byte(uint offset) {
+    uint word = texelFetch(source_buffer, int(offset >> 2u)).r;
+    return (word >> ((offset & 3u) * 8u)) & 255u;
+}
+
+uvec2 load_pair(uint offset) {
+    uint shift = (offset & 3u) * 8u;
+    uint word = texelFetch(source_buffer, int(offset >> 2u)).r;
+    if (shift <= 16u) {
+        return uvec2((word >> shift) & 255u, (word >> (shift + 8u)) & 255u);
+    }
+    uint next_word = texelFetch(source_buffer, int((offset >> 2u) + 1u)).r;
+    return uvec2((word >> 24u) & 255u, next_word & 255u);
+}
+
+vec2 load_chroma(ivec2 location) {
+    ivec2 extent = ivec2(int(params.width >> 1u), int(params.height >> 1u));
+    ivec2 clamped = clamp(location, ivec2(0), extent - ivec2(1));
+    uint offset = params.uv_offset
+        + uint(clamped.y) * params.uv_pitch
+        + uint(clamped.x) * 2u;
+    return vec2(load_pair(offset));
+}
+
+vec2 reconstructed_chroma(ivec2 pixel) {
+    float x = params.x_chroma_offset == 0u
+        ? float(pixel.x) * 0.5
+        : (float(pixel.x) - 0.5) * 0.5;
+    float y = params.y_chroma_offset == 0u
+        ? float(pixel.y) * 0.5
+        : (float(pixel.y) - 0.5) * 0.5;
+    ivec2 low = ivec2(floor(vec2(x, y)));
+    vec2 fraction = fract(vec2(x, y));
+    vec2 top = mix(load_chroma(low), load_chroma(low + ivec2(1, 0)), fraction.x);
+    vec2 bottom = mix(
+        load_chroma(low + ivec2(0, 1)),
+        load_chroma(low + ivec2(1, 1)),
+        fraction.x
+    );
+    return mix(top, bottom, fraction.y);
+}
+
+vec4 convert_code(float y_code, vec2 chroma_code) {
+    float y;
+    vec2 chroma;
+    if (params.color_range == 0u) {
+        y = clamp((y_code - 16.0) / 219.0, 0.0, 1.0);
+        chroma = (chroma_code - vec2(128.0)) / 224.0;
+    } else {
+        y = y_code / 255.0;
+        chroma = (chroma_code - vec2(128.0)) / 255.0;
+    }
+
+    float cb = chroma.x;
+    float cr = chroma.y;
+    vec3 rgb = vec3(
+        y + 1.5748 * cr,
+        y - 0.187324 * cb - 0.468124 * cr,
+        y + 1.8556 * cb
+    );
+    return vec4(clamp(rgb, 0.0, 1.0), 1.0);
+}
+
+void main() {
+    ivec2 block = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 pixel = block * 2;
+    if (pixel.x >= int(params.width) || pixel.y >= int(params.height)) {
+        return;
+    }
+
+    uint row0 = params.y_offset + uint(pixel.y) * params.y_pitch + uint(pixel.x);
+    uint row1 = row0 + params.y_pitch;
+    uvec2 y_top = load_pair(row0);
+    uvec2 y_bottom = load_pair(row1);
+
+    vec2 c00;
+    vec2 c10;
+    vec2 c01;
+    vec2 c11;
+    if (params.x_chroma_offset == 0u && params.y_chroma_offset == 1u) {
+        // Left horizontal / midpoint vertical. Six UV pair fetches serve all four pixels.
+        ivec2 base = ivec2(block.x, block.y - 1);
+        vec2 a0 = load_chroma(base);
+        vec2 a1 = load_chroma(base + ivec2(1, 0));
+        vec2 b0 = load_chroma(base + ivec2(0, 1));
+        vec2 b1 = load_chroma(base + ivec2(1, 1));
+        vec2 d0 = load_chroma(base + ivec2(0, 2));
+        vec2 d1 = load_chroma(base + ivec2(1, 2));
+        c00 = mix(a0, b0, 0.75);
+        c10 = mix(mix(a0, a1, 0.5), mix(b0, b1, 0.5), 0.75);
+        c01 = mix(b0, d0, 0.25);
+        c11 = mix(mix(b0, b1, 0.5), mix(d0, d1, 0.5), 0.25);
+    } else {
+        c00 = reconstructed_chroma(pixel);
+        c10 = reconstructed_chroma(pixel + ivec2(1, 0));
+        c01 = reconstructed_chroma(pixel + ivec2(0, 1));
+        c11 = reconstructed_chroma(pixel + ivec2(1, 1));
+    }
+
+    imageStore(output_image, pixel, convert_code(float(y_top.x), c00));
+    imageStore(output_image, pixel + ivec2(1, 0), convert_code(float(y_top.y), c10));
+    imageStore(output_image, pixel + ivec2(0, 1), convert_code(float(y_bottom.x), c01));
+    imageStore(output_image, pixel + ivec2(1, 1), convert_code(float(y_bottom.y), c11));
+}

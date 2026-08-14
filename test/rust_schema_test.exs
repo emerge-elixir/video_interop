@@ -1,7 +1,7 @@
 defmodule VideoInterop.RustSchemaTest do
   use ExUnit.Case, async: true
 
-  alias VideoInterop.{Frame, Lease, Rect, SchemaNative, SyncFile}
+  alias VideoInterop.{Frame, Lease, Rect, SchemaConsumerNative, SchemaNative, SyncFile}
   alias VideoInterop.DMABuf.{Descriptor, FourCC, Layer, Object, Plane}
 
   test "Rustler decodes the published descriptor schema" do
@@ -12,7 +12,8 @@ defmodule VideoInterop.RustSchemaTest do
   test "Rustler decodes frame, acquire synchronization, and lifetime fields" do
     frame = frame(10, %SyncFile{acquire_fence_fd: 10})
 
-    assert SchemaNative.inspect_frame(frame) == {:ok, {640, 480, 640, 480, true, true}}
+    assert SchemaNative.inspect_frame(frame) ==
+             {:ok, {640, 480, 640, 480, true, true, false}}
   end
 
   test "Rustler rejects oversized AVDRM lists before decoding all entries" do
@@ -26,21 +27,27 @@ defmodule VideoInterop.RustSchemaTest do
 
   test "dropping a prepared frame closes fds without releasing the caller's lease" do
     assert {:ok, {fd, resource}} = SchemaNative.open_test_fd()
+    assert {:ok, {dispatcher, _probe}} = SchemaNative.start_dispatcher()
+    on_exit(fn -> assert SchemaNative.shutdown_dispatcher(dispatcher) == {:ok, true} end)
     token = make_ref()
     lease = Lease.new(self(), token)
 
-    assert SchemaNative.prepare_and_drop_frame(frame(fd, :implicit, lease)) == {:ok, true}
+    assert SchemaNative.prepare_and_drop_frame(frame(fd, :implicit, lease), dispatcher) ==
+             {:ok, true}
+
     refute_receive {:video_interop_release, ^token, _holder}, 50
     assert is_reference(resource)
   end
 
   test "claiming native ownership releases the lease when the frame drops" do
     assert {:ok, {fd, resource}} = SchemaNative.open_test_fd()
+    assert {:ok, {dispatcher, _probe}} = SchemaNative.start_dispatcher()
+    on_exit(fn -> assert SchemaNative.shutdown_dispatcher(dispatcher) == {:ok, true} end)
     token = make_ref()
     lease = Lease.new(self(), token)
     frame = frame(fd, :implicit, lease)
 
-    assert SchemaNative.claim_and_drop_frame(frame) == {:ok, true}
+    assert SchemaNative.claim_and_drop_frame(frame, dispatcher) == {:ok, true}
     assert_receive {:video_interop_release, ^token, holder}, 1_000
     assert holder == lease.holder
     assert is_reference(resource)
@@ -48,13 +55,137 @@ defmodule VideoInterop.RustSchemaTest do
 
   test "explicit native retirement releases exactly once" do
     assert {:ok, {fd, resource}} = SchemaNative.open_test_fd()
+    assert {:ok, {dispatcher, _probe}} = SchemaNative.start_dispatcher()
+    on_exit(fn -> assert SchemaNative.shutdown_dispatcher(dispatcher) == {:ok, true} end)
     token = make_ref()
     lease = Lease.new(self(), token)
 
-    assert SchemaNative.retire_frame(frame(fd, :implicit, lease)) == {:ok, true}
+    assert SchemaNative.retire_frame(frame(fd, :implicit, lease), dispatcher) == {:ok, true}
     assert_receive {:video_interop_release, ^token, holder}, 1_000
     assert holder == lease.holder
     refute_receive {:video_interop_release, ^token, _holder}, 50
+    assert is_reference(resource)
+  end
+
+  test "close waits for admitted claims, rejects new admission, and can be retried" do
+    assert {:ok, {fd, resource}} = SchemaNative.open_test_fd()
+    assert {:ok, {dispatcher, probe}} = SchemaNative.start_dispatcher()
+    lease = Lease.new(self(), make_ref())
+    frame = frame(fd, :implicit, lease)
+    assert {:ok, claim} = SchemaNative.claim_frame(frame, dispatcher)
+
+    on_exit(fn ->
+      SchemaNative.retire_claim(claim)
+      SchemaNative.shutdown_dispatcher(dispatcher)
+    end)
+
+    assert {:error,
+            "video-interop release dispatcher unavailable: timed out waiting for dispatcher clients to retire"} =
+             SchemaNative.shutdown_dispatcher_timeout(dispatcher, 10)
+
+    assert SchemaNative.dispatcher_health(probe) == "stopping"
+
+    assert {:error, "video-interop release dispatcher unavailable: dispatcher is Stopping"} =
+             SchemaNative.claim_frame(frame, dispatcher)
+
+    assert SchemaNative.retire_claim(claim) == {:ok, true}
+    assert_receive {:video_interop_release, token, holder}, 1_000
+    assert token == lease.token
+    assert holder == lease.holder
+    assert SchemaNative.shutdown_dispatcher(dispatcher) == {:ok, true}
+    assert SchemaNative.dispatcher_health(probe) == "stopped"
+    assert is_reference(resource)
+  end
+
+  test "admission racing close either owns a counted client or is rejected" do
+    assert {:ok, {fd, resource}} = SchemaNative.open_test_fd()
+
+    Enum.each(1..100, fn _iteration ->
+      assert {:ok, {dispatcher, probe}} = SchemaNative.start_dispatcher()
+      lease = Lease.new(self(), make_ref())
+      candidate = frame(fd, :implicit, lease)
+
+      claim_task =
+        Task.async(fn ->
+          receive do
+            :race -> SchemaNative.claim_frame(candidate, dispatcher)
+          end
+        end)
+
+      close_task =
+        Task.async(fn ->
+          receive do
+            :race -> SchemaNative.shutdown_dispatcher_timeout(dispatcher, 20)
+          end
+        end)
+
+      send(claim_task.pid, :race)
+      send(close_task.pid, :race)
+      claim_result = Task.await(claim_task, 1_000)
+      close_result = Task.await(close_task, 1_000)
+
+      case claim_result do
+        {:ok, claim} ->
+          assert close_result ==
+                   {:error,
+                    "video-interop release dispatcher unavailable: timed out waiting for dispatcher clients to retire"}
+
+          assert SchemaNative.retire_claim(claim) == {:ok, true}
+          assert_receive {:video_interop_release, token, holder}, 1_000
+          assert token == lease.token
+          assert holder == lease.holder
+          assert SchemaNative.shutdown_dispatcher(dispatcher) == {:ok, true}
+
+        {:error, reason} ->
+          assert reason in [
+                   "video-interop release dispatcher unavailable: dispatcher is Stopping",
+                   "video-interop release dispatcher unavailable: dispatcher is Stopped"
+                 ]
+
+          assert close_result == {:ok, true}
+      end
+
+      assert SchemaNative.dispatcher_health(probe) == "stopped"
+    end)
+
+    assert is_reference(resource)
+  end
+
+  test "the shared crate registers resources in separate producer and consumer NIFs" do
+    assert {:ok, {producer_dispatcher, _probe}} = SchemaNative.start_dispatcher()
+
+    assert {:ok, {consumer_dispatcher, _consumer_probe}} =
+             SchemaConsumerNative.start_dispatcher()
+
+    on_exit(fn ->
+      assert SchemaConsumerNative.shutdown_dispatcher(consumer_dispatcher) == {:ok, true}
+      assert SchemaNative.shutdown_dispatcher(producer_dispatcher) == {:ok, true}
+    end)
+
+    assert {:ok, {fd, resource}} = SchemaNative.open_test_fd()
+
+    owner = self()
+    token = make_ref()
+    holder = make_ref()
+
+    assert {:ok, guard} =
+             SchemaNative.new_abandonment_guard(producer_dispatcher, owner, token, holder)
+
+    lease = %Lease{
+      owner: owner,
+      token: token,
+      holder: holder,
+      abandonment_guard: guard
+    }
+
+    assert VideoInterop.AbandonmentGuard.valid?(guard)
+    guarded_frame = frame(fd, :implicit, lease)
+    assert SchemaConsumerNative.guard_is_opaque_resource(guarded_frame)
+
+    assert SchemaConsumerNative.claim_and_drop_frame(guarded_frame, consumer_dispatcher) ==
+             {:ok, true}
+
+    assert_receive {:video_interop_release, ^token, ^holder}, 1_000
     assert is_reference(resource)
   end
 

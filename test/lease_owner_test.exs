@@ -516,7 +516,7 @@ defmodule VideoInterop.LeaseOwnerTest do
     send(first_owner, {:video_interop_drain, self(), drain_ref})
     :ok = :sys.resume(first_owner)
 
-    assert_receive {:video_interop_retained, ^retain_ref, :ok}
+    assert_receive {:video_interop_retained, ^retain_ref, {:ok, nil}}
     send(first_owner, {:video_interop_confirm_retain, first_root.token, child_holder, retain_ref})
     Process.unalias(retain_ref)
 

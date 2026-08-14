@@ -1,3 +1,7 @@
 [workspace]
-members = ["rust/video-interop", "test/native/schema_test"]
+members = [
+  "rust/video-interop",
+  "test/native/schema_consumer_test",
+  "test/native/schema_test",
+]
 resolver = "3"

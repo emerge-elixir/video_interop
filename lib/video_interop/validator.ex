@@ -1,7 +1,7 @@
 defmodule VideoInterop.Validator do
-  @moduledoc "Pure structural validation for video formats and borrowed frames."
+  @moduledoc "Structural validation and producer-authority verification for borrowed frames."
 
-  alias VideoInterop.{Colorimetry, Frame, Lease, Rect, SyncFile}
+  alias VideoInterop.{AbandonmentGuard, Colorimetry, Frame, Lease, Rect, SyncFile}
 
   alias VideoInterop.DMABuf.{
     Descriptor,
@@ -62,6 +62,7 @@ defmodule VideoInterop.Validator do
          :ok <- positive_bounded(format.height, @max_u32, [:format, :height]),
          :ok <- optional_rational(format.framerate, [:format, :framerate]),
          :ok <- validate_storage_format(format.storage),
+         :ok <- stream_acquire_sync(format.acquire_sync),
          :ok <- colorimetry(format.colorimetry),
          :ok <- rational(format.pixel_aspect_ratio, [:format, :pixel_aspect_ratio]),
          :ok <- interlace_mode(format.interlace_mode),
@@ -77,7 +78,8 @@ defmodule VideoInterop.Validator do
     with :ok <- validate_frame(frame),
          :ok <- validate_format(format),
          :ok <- matching_dimensions(frame, format),
-         :ok <- matching_storage(frame, format) do
+         :ok <- matching_storage(frame, format),
+         :ok <- matching_acquire_sync(frame.acquire_sync, format.acquire_sync) do
       :ok
     end
   end
@@ -214,9 +216,29 @@ defmodule VideoInterop.Validator do
 
   defp validate_acquire_sync(value), do: {:error, {:invalid_acquire_sync, value}}
 
-  defp validate_lease(%Lease{owner: owner, holder: holder})
+  defp stream_acquire_sync(policy) when policy in [:implicit, :sync_file, :per_frame], do: :ok
+
+  defp stream_acquire_sync(policy),
+    do: {:error, {:invalid_field, [:format, :acquire_sync], policy}}
+
+  defp matching_acquire_sync(_actual, :per_frame), do: :ok
+  defp matching_acquire_sync(:implicit, :implicit), do: :ok
+  defp matching_acquire_sync(%SyncFile{}, :sync_file), do: :ok
+
+  defp matching_acquire_sync(actual, expected),
+    do: {:error, {:acquire_sync_mismatch, acquire_sync_kind(actual), expected}}
+
+  defp acquire_sync_kind(:implicit), do: :implicit
+  defp acquire_sync_kind(%SyncFile{}), do: :sync_file
+
+  defp validate_lease(%Lease{owner: owner, holder: holder, abandonment_guard: guard} = lease)
        when is_pid(owner) and is_reference(holder) do
-    if node(owner) == node(), do: :ok, else: {:error, {:remote_lease_owner, owner}}
+    cond do
+      node(owner) != node() -> {:error, {:remote_lease_owner, owner}}
+      is_nil(guard) -> :ok
+      AbandonmentGuard.valid?(guard) -> :ok
+      true -> {:error, {:invalid_lease, lease}}
+    end
   end
 
   defp validate_lease(value), do: {:error, {:invalid_lease, value}}

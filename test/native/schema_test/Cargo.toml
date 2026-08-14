@@ -10,4 +10,4 @@ crate-type = ["cdylib"]
 [dependencies]
 libc = "0.2"
 rustler = "0.38"
-video-interop = { path = "../../../rust/video-interop" }
+video-interop = { path = "../../../rust/video-interop", features = ["test-support"] }

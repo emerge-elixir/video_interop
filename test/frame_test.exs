@@ -33,12 +33,31 @@ defmodule VideoInterop.FrameTest do
              VideoInterop.validate(%{frame() | acquire_sync: :unsupported})
   end
 
+  test "enforces the negotiated acquire synchronization policy" do
+    implicit = frame()
+    explicit = %{implicit | acquire_sync: %SyncFile{acquire_fence_fd: 20}}
+
+    assert :ok = VideoInterop.validate(implicit, %{format() | acquire_sync: :implicit})
+    assert :ok = VideoInterop.validate(explicit, %{format() | acquire_sync: :sync_file})
+    assert :ok = VideoInterop.validate(implicit, %{format() | acquire_sync: :per_frame})
+    assert :ok = VideoInterop.validate(explicit, %{format() | acquire_sync: :per_frame})
+
+    assert {:error, {:acquire_sync_mismatch, :implicit, :sync_file}} =
+             VideoInterop.validate(implicit, %{format() | acquire_sync: :sync_file})
+
+    assert {:error, {:acquire_sync_mismatch, :sync_file, :implicit}} =
+             VideoInterop.validate(explicit, %{format() | acquire_sync: :implicit})
+  end
+
   test "rejects invalid interpretation metadata" do
     assert {:error, {:invalid_field, [:format, :interlace_mode], 123}} =
              VideoInterop.validate(%{format() | interlace_mode: 123})
 
     assert {:error, {:invalid_field, [:format, :colorimetry, :range], :bogus}} =
              VideoInterop.validate(%{format() | colorimetry: %Colorimetry{range: :bogus}})
+
+    assert {:error, {:invalid_field, [:format, :acquire_sync], :bogus}} =
+             VideoInterop.validate(%{format() | acquire_sync: :bogus})
   end
 
   test "retains a frame with identical data and a distinct holder" do

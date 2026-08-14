@@ -91,10 +91,22 @@ pub enum DuplicateError {
 
 #[cfg(feature = "rustler")]
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
-#[error("failed to start the video-interop lease release worker: {message}")]
-pub struct ReleaseWorkerError {
+#[error("video-interop release dispatcher unavailable: {message}")]
+pub struct DispatcherError {
     pub(crate) message: String,
 }
+
+#[cfg(feature = "rustler")]
+impl DispatcherError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+#[cfg(feature = "rustler")]
+pub type ReleaseWorkerError = DispatcherError;
 
 #[cfg(feature = "rustler")]
 #[derive(Debug, Error)]
@@ -102,5 +114,5 @@ pub enum PrepareError {
     #[error(transparent)]
     Duplicate(#[from] DuplicateError),
     #[error(transparent)]
-    ReleaseWorker(#[from] ReleaseWorkerError),
+    Dispatcher(#[from] DispatcherError),
 }

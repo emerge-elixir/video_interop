@@ -5,9 +5,10 @@ video frames across Elixir and native Rust code.
 
 The project publishes one Hex package (`video_interop`) and one Rust crate
 (`video-interop`) from the same repository. The Hex archive also includes the
-crate source. Core ownership, Rustler schema support, and optional EGL/Vulkan
-adapters stay in that one crate; graphics API integrations are feature-gated
-rather than split into separate packages.
+crate source, but the Hex package itself loads no NIF. Core ownership, optional
+Rustler schema support, and optional EGL/Vulkan adapters stay in that one crate;
+graphics API integrations are feature-gated rather than split into separate
+packages.
 
 Version 0.1 supports:
 
@@ -20,8 +21,8 @@ Version 0.1 supports:
   EGL/GL linkage;
 - visible/coded frame geometry and generic format metadata;
 - deterministic BEAM leases with safe fan-out and draining;
-- exact optional Rustler encoding/decoding for frame, DMA-BUF, sync-file, and
-  lease boundary structs.
+- exact optional Rustler encoding/decoding for frame, stream format,
+  colorimetry, DMA-BUF, sync-file, and lease boundary structs.
 
 It does not allocate buffers, initialize graphics APIs, render, present, or
 define a streaming-framework transport.
@@ -37,6 +38,7 @@ alias VideoInterop.DMABuf.{Descriptor, FourCC, Layer, Object, Plane}
   LeaseOwner.start_link(
     producer: self(),
     release: fn backend_token -> Producer.release(backend_token) end,
+    abandonment_guard_factory: &Producer.Native.new_abandonment_guard/3,
     max_active: 4
   )
 
@@ -116,6 +118,24 @@ owner-crash/message-drop destructor fallback. A holder must never be copied to
 another consumer; use `VideoInterop.retain/2` to return the same frame with a
 unique child holder.
 
+When configured, `abandonment_guard_factory` runs transactionally before a
+root or retained holder is published. It must return a fresh
+`%VideoInterop.AbandonmentGuard{}` authority envelope for every holder. The
+authority validates the producer's own Rustler resource type; bare or wrapped
+ordinary references are rejected. The resource queues
+`{:video_interop_abandoned, token, holder}` when the last holder-bearing term
+disappears. Explicit and fallback
+release races are idempotent; only fallbacks that retire an active holder
+increase the separate `abandonments` counter. The owner keeps at most 1,024
+ordered release tombstones. Recognized explicit-after-fallback races increase
+`late_releases_after_abandonment`, actual repeated explicit releases increase
+`duplicate_releases`, and releases older than retained history are reported as
+`unclassified_releases` rather than guessed to be duplicates.
+`release_tombstone_evictions` reports total history lost at the bound, while
+`abandonment_tombstone_evictions` identifies the fallback subset. The owner emits
+`{:video_interop_lease_owner_final_stats, owner, snapshot}` immediately before
+the existing `{:video_interop_lease_owner_drained, owner}` notification.
+
 `LeaseOwner.close/2` begins draining without waiting. `LeaseOwner.drain/2`
 registers a waiter atomically and returns only after all holders and final
 release callbacks complete. Optional single-flight exponential release retry is
@@ -153,8 +173,11 @@ ownership unknown, so the helper raises rather than risking a double release.
 
 ## Rust crate
 
-The default `rustler` feature exposes exact frame/descriptor/lease decoders for
-the native boundary:
+The default `rustler` feature exposes exact stream-format/colorimetry and
+frame/descriptor/lease encoders and decoders for the native boundary. Rust
+`Format` mirrors every field in `%VideoInterop.Format{}`; modifier and acquire
+policies remain distinct, and `:unspecified` color values are preserved rather
+than inferred:
 
 ```toml
 [dependencies]
@@ -162,10 +185,14 @@ video-interop = "0.1"
 ```
 
 ```rust
-use video_interop::Frame;
+use rustler::ResourceArc;
+use video_interop::{Frame, ReleaseDispatcher};
 
-fn accept(frame: Frame<'_>) -> Result<(), Box<dyn std::error::Error>> {
-    let prepared = frame.prepare_cloexec()?;
+fn accept(
+    frame: Frame<'_>,
+    dispatcher: &ResourceArc<ReleaseDispatcher>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let prepared = frame.prepare_cloexec(dispatcher)?;
 
     // Transfer to a native queue first. Claim only when that queue accepts
     // responsibility for eventual release.
@@ -182,9 +209,17 @@ video-interop = { version = "0.1", default-features = false }
 ```
 
 Dropping `PreparedVideoFrame` closes duplicated fds but leaves release with the
-Elixir caller. Dropping `ClaimedVideoFrame` or `ClaimedLease` queues
-`{:video_interop_release, token, holder}` through a dedicated native worker, so
-Rustler's `OwnedEnv::send_and_clear` never runs on a BEAM scheduler thread.
+Elixir caller while preserving its opaque guard copy. A claimed frame transfers
+that guard into native state until exact retirement. Dropping
+`ClaimedVideoFrame` or `ClaimedLease` queues `{:video_interop_release, token,
+holder}` through a lifecycle-owned `ReleaseDispatcher` resource, so Rustler's
+`OwnedEnv::send_and_clear` never runs on a BEAM scheduler thread. Guards and
+claims keep the dispatcher resource—and therefore its NIF library—alive. After
+exact holder/claim drainage, the lifecycle owner must call
+`ReleaseDispatcher::close_and_join` from a dirty-I/O NIF. It stops admission,
+drains the FIFO, and joins the worker. Resource and guard destructors never
+wait, join, or send through an `OwnedEnv`; an unjoined final owner is fatal, as
+is queue loss or worker panic after publication.
 
 ## Migration plan
 
@@ -197,7 +232,15 @@ for the coordinated adapter and downstream consumer cutover.
 The `egl` feature provides dynamically loaded native sync-file fence creation,
 import, bounded waits, duplication, and destruction without linking EGL or GL.
 It accepts a caller-owned current display/context and does not create a graphics
-runtime. Vulkan `SYNC_FD`, Metal, and Direct3D adapters remain later work.
+runtime.
+
+The `vulkan` feature accepts a caller-selected `ash` device and owns generic
+DMA-BUF capability queries, memory import, `SYNC_FD` acquire, external queue
+ownership, and release-fence retirement. Directly sampleable images stay
+zero-copy. Linear NV12 can use an asynchronous GPU conversion to an
+optimal-tiled sampling image when the active driver cannot sample the producer
+layout directly. The adapter has no Skia, KMS, Wayland, EGL, or GL dependency.
+Metal and Direct3D adapters remain later work.
 
 ## Validation
 
@@ -211,8 +254,10 @@ cargo fmt --all -- --check
 cargo test --workspace
 cargo test -p video-interop --no-default-features
 cargo test -p video-interop --no-default-features --features egl
+cargo test -p video-interop --no-default-features --features vulkan
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p video-interop --no-default-features --features egl --all-targets -- -D warnings
+cargo clippy -p video-interop --no-default-features --features vulkan --all-targets -- -D warnings
 ```
 
 ## License

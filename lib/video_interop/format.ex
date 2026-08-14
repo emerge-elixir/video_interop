@@ -4,7 +4,8 @@ defmodule VideoInterop.Format do
 
   `framerate: nil` represents an unknown cadence. The storage-specific format
   is held in `storage`, allowing future non-DMA-BUF storage without changing
-  the outer video interpretation fields.
+  the outer video interpretation fields. `acquire_sync` declares whether frames
+  use implicit synchronization, sync files, or a compatibility per-frame mix.
   """
 
   alias VideoInterop.Colorimetry
@@ -15,6 +16,7 @@ defmodule VideoInterop.Format do
             height: nil,
             framerate: nil,
             storage: nil,
+            acquire_sync: :per_frame,
             colorimetry: %Colorimetry{},
             pixel_aspect_ratio: {1, 1},
             interlace_mode: :progressive,
@@ -22,12 +24,14 @@ defmodule VideoInterop.Format do
 
   @type interlace_mode ::
           :progressive | :interlaced_top_first | :interlaced_bottom_first | :mixed
+  @type acquire_sync :: :implicit | :sync_file | :per_frame
 
   @type t :: %__MODULE__{
           width: pos_integer(),
           height: pos_integer(),
           framerate: {pos_integer(), pos_integer()} | nil,
           storage: DMABuf.Format.t(),
+          acquire_sync: acquire_sync(),
           colorimetry: Colorimetry.t(),
           pixel_aspect_ratio: {pos_integer(), pos_integer()},
           interlace_mode: interlace_mode(),

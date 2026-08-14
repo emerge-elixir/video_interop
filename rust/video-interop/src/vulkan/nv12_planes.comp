@@ -1,0 +1,60 @@
+#version 450
+
+// One invocation copies one 2x2 NV12 block into optimal R8 and RG8 images. No transfer-source
+// usage or TFU operation touches the producer allocation.
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform usamplerBuffer source_buffer;
+layout(set = 0, binding = 1, r8) writeonly uniform image2D luma_image;
+layout(set = 0, binding = 2, rg8) writeonly uniform image2D chroma_image;
+
+layout(push_constant) uniform Parameters {
+    uint width;
+    uint height;
+    uint y_offset;
+    uint y_pitch;
+    uint uv_offset;
+    uint uv_pitch;
+    uint color_range;
+    uint x_chroma_offset;
+    uint y_chroma_offset;
+} params;
+
+uint load_byte(uint offset) {
+    uint word = texelFetch(source_buffer, int(offset >> 2u)).r;
+    return (word >> ((offset & 3u) * 8u)) & 255u;
+}
+
+uvec2 load_pair(uint offset) {
+    uint shift = (offset & 3u) * 8u;
+    uint word = texelFetch(source_buffer, int(offset >> 2u)).r;
+    if (shift <= 16u) {
+        return uvec2((word >> shift) & 255u, (word >> (shift + 8u)) & 255u);
+    }
+    uint next_word = texelFetch(source_buffer, int((offset >> 2u) + 1u)).r;
+    return uvec2((word >> 24u) & 255u, next_word & 255u);
+}
+
+void main() {
+    ivec2 block = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 pixel = block * 2;
+    if (pixel.x >= int(params.width) || pixel.y >= int(params.height)) {
+        return;
+    }
+
+    uint y0_offset = params.y_offset + uint(pixel.y) * params.y_pitch + uint(pixel.x);
+    uvec2 y0 = load_pair(y0_offset);
+    uvec2 y1 = load_pair(y0_offset + params.y_pitch);
+    imageStore(luma_image, pixel, vec4(float(y0.x) / 255.0, 0.0, 0.0, 1.0));
+    imageStore(luma_image, pixel + ivec2(1, 0), vec4(float(y0.y) / 255.0, 0.0, 0.0, 1.0));
+    imageStore(luma_image, pixel + ivec2(0, 1), vec4(float(y1.x) / 255.0, 0.0, 0.0, 1.0));
+    imageStore(luma_image, pixel + ivec2(1, 1), vec4(float(y1.y) / 255.0, 0.0, 0.0, 1.0));
+
+    uint uv_offset = params.uv_offset + uint(block.y) * params.uv_pitch + uint(block.x) * 2u;
+    uvec2 uv = load_pair(uv_offset);
+    imageStore(
+        chroma_image,
+        block,
+        vec4(float(uv.x) / 255.0, float(uv.y) / 255.0, 0.0, 1.0)
+    );
+}

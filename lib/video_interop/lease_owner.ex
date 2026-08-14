@@ -15,13 +15,26 @@ defmodule VideoInterop.LeaseOwner do
   token. Retry is single-flight per public lease token. Failed entries remain
   alive and retryable after producer death or retry exhaustion; there is no
   implicit fatal policy based on observer liveness.
+
+  A producer-supplied `abandonment_guard_factory` may attach one unique,
+  authority-validated native resource envelope to every root and retained holder.
+  Guard construction is transactional: no holder is published when construction fails. Guard
+  destructor messages are fallback releases with separate abandonment
+  accounting and are idempotent with the deterministic explicit release path.
+  Ordered release tombstones are bounded; releases older than retained history
+  are reported as unclassified instead of being guessed to be duplicates.
   """
 
   use GenServer
 
-  alias VideoInterop.Lease
+  alias VideoInterop.{AbandonmentGuard, Lease}
+
+  @release_tombstone_limit 1_024
 
   @type release_callback :: (term() -> term()) | {module(), atom(), [term()]}
+  @type abandonment_guard_factory ::
+          (pid(), reference(), reference() -> {:ok, AbandonmentGuard.t()} | {:error, term()})
+          | {module(), atom(), [term()]}
   @type retry_policy ::
           :manual
           | {:exponential,
@@ -37,6 +50,7 @@ defmodule VideoInterop.LeaseOwner do
           | {:max_active, pos_integer() | :infinity}
           | {:notify, pid() | nil}
           | {:notify_releases, boolean()}
+          | {:abandonment_guard_factory, abandonment_guard_factory() | nil}
 
   @type ownership_error :: {:caller_owned | :transferred, term()}
 
@@ -45,15 +59,25 @@ defmodule VideoInterop.LeaseOwner do
           active_leases: non_neg_integer(),
           active_holders: non_neg_integer(),
           oldest_lease_age_ns: non_neg_integer() | nil,
+          issued_leases: non_neg_integer(),
+          issued_holders: non_neg_integer(),
           retain_requests: non_neg_integer(),
           retain_cancellations: non_neg_integer(),
+          explicit_releases: non_neg_integer(),
+          abandonments: non_neg_integer(),
+          late_releases_after_abandonment: non_neg_integer(),
           duplicate_releases: non_neg_integer(),
+          unclassified_releases: non_neg_integer(),
+          release_tombstone_evictions: non_neg_integer(),
+          abandonment_tombstone_evictions: non_neg_integer(),
           release_callbacks: non_neg_integer(),
           release_failures: non_neg_integer(),
           release_retries: non_neg_integer(),
           release_callback_total_ns: non_neg_integer(),
           release_callback_max_ns: non_neg_integer(),
           malformed_messages: non_neg_integer(),
+          release_tombstones: non_neg_integer(),
+          release_tombstone_limit: pos_integer(),
           drain_waiters: non_neg_integer(),
           message_queue_len: non_neg_integer()
         }
@@ -63,7 +87,9 @@ defmodule VideoInterop.LeaseOwner do
 
   The owner traps the producer's exit and drains issued leases instead of
   releasing them early. `release_retry` defaults to `:manual`. Automatic
-  exponential retry requires an idempotent release callback.
+  exponential retry requires an idempotent release callback. Before stopping
+  after successful drainage, the owner sends an immutable final-stats
+  notification followed by the existing two-field drained notification.
   """
   @spec start_link([option()]) :: GenServer.on_start()
   def start_link(opts) do
@@ -151,8 +177,18 @@ defmodule VideoInterop.LeaseOwner do
     notify = Keyword.get(opts, :notify, producer)
     notify_releases = Keyword.get(opts, :notify_releases, Keyword.has_key?(opts, :notify))
     release_retry = normalize_retry_policy(Keyword.get(opts, :release_retry, :manual))
+    abandonment_guard_factory = Keyword.get(opts, :abandonment_guard_factory)
 
-    validate_options!(producer, release, max_active, notify, notify_releases, release_retry)
+    validate_options!(
+      producer,
+      release,
+      max_active,
+      notify,
+      notify_releases,
+      release_retry,
+      abandonment_guard_factory
+    )
+
     Process.link(producer)
 
     {:ok,
@@ -162,6 +198,7 @@ defmodule VideoInterop.LeaseOwner do
        notify_releases: notify_releases,
        release: release,
        release_retry: release_retry,
+       abandonment_guard_factory: abandonment_guard_factory,
        max_active: max_active,
        mode: :open,
        leases: %{},
@@ -170,10 +207,20 @@ defmodule VideoInterop.LeaseOwner do
        drain_waiters: %{},
        drain_monitors: %{},
        retry_timers: %{},
+       release_tombstones: %{},
+       release_tombstone_order: :queue.new(),
        counters: %{
+         issued_leases: 0,
+         issued_holders: 0,
          retain_requests: 0,
          retain_cancellations: 0,
+         explicit_releases: 0,
+         abandonments: 0,
+         late_releases_after_abandonment: 0,
          duplicate_releases: 0,
+         unclassified_releases: 0,
+         release_tombstone_evictions: 0,
+         abandonment_tombstone_evictions: 0,
          release_callbacks: 0,
          release_failures: 0,
          release_retries: 0,
@@ -230,29 +277,73 @@ defmodule VideoInterop.LeaseOwner do
       true ->
         token = make_ref()
         holder = make_ref()
-        monitor_ref = Process.monitor(reply_to)
 
-        entry = %{
-          backend_token: backend_token,
-          holders: MapSet.new([holder]),
-          issued_at_ns: System.monotonic_time(:nanosecond),
-          metadata: metadata,
-          root_holder: holder,
-          pending_issue: {monitor_ref, request_ref},
-          pending_retains: %{},
-          release_attempts: 0,
-          status: :active
-        }
+        case create_abandonment_guard(state.abandonment_guard_factory, token, holder) do
+          {:ok, abandonment_guard} ->
+            monitor_ref = Process.monitor(reply_to)
 
-        lease = %Lease{owner: self(), token: token, holder: holder}
+            entry = %{
+              backend_token: backend_token,
+              holders: MapSet.new([holder]),
+              issued_at_ns: System.monotonic_time(:nanosecond),
+              metadata: metadata,
+              root_holder: holder,
+              pending_issue: {monitor_ref, request_ref},
+              pending_retains: %{},
+              release_attempts: 0,
+              status: :active
+            }
 
-        state =
-          state
-          |> put_in([:leases, token], entry)
-          |> put_in([:pending_issues, request_ref], token)
-          |> put_in([:protocol_monitors, monitor_ref], {:issue, token, request_ref})
+            lease = %Lease{
+              owner: self(),
+              token: token,
+              holder: holder,
+              abandonment_guard: abandonment_guard
+            }
 
-        reply_issue(reply_to, request_ref, {:ok, lease})
+            state =
+              state
+              |> put_in([:leases, token], entry)
+              |> put_in([:pending_issues, request_ref], token)
+              |> put_in([:protocol_monitors, monitor_ref], {:issue, token, request_ref})
+              |> update_counter(:issued_leases, 1)
+              |> update_counter(:issued_holders, 1)
+
+            reply_issue(reply_to, request_ref, {:ok, lease})
+            continue_after_guard_reply(abandonment_guard, state)
+
+          {:error, reason} ->
+            reject_issue(
+              {:abandonment_guard_factory_failed, reason},
+              backend_token,
+              metadata,
+              reply_to,
+              request_ref,
+              state,
+              token
+            )
+        end
+    end
+  end
+
+  def handle_info({:video_interop_abandoned, token, holder}, state)
+      when is_reference(token) and is_reference(holder) do
+    case Map.fetch(state.leases, token) do
+      {:ok, %{status: :active} = entry} ->
+        if MapSet.member?(entry.holders, holder) do
+          {entry, state} = clear_pending_retain(holder, entry, state)
+
+          state =
+            state
+            |> update_counter(:abandonments, 1)
+            |> put_release_tombstone({token, holder}, :abandoned)
+
+          remove_holder(token, holder, entry, state)
+        else
+          {:noreply, state}
+        end
+
+      _other ->
         {:noreply, state}
     end
   end
@@ -338,13 +429,39 @@ defmodule VideoInterop.LeaseOwner do
 
   def handle_info({:video_interop_release, token, holder}, state)
       when is_reference(token) and is_reference(holder) do
-    case Map.fetch(state.leases, token) do
-      {:ok, %{status: :active} = entry} ->
-        {entry, state} = clear_pending_retain(holder, entry, state)
-        remove_holder(token, holder, entry, state)
+    holder_id = {token, holder}
 
-      _other ->
+    case Map.get(state.release_tombstones, holder_id) do
+      :abandoned ->
+        state =
+          state
+          |> put_in([:release_tombstones, holder_id], :explicit)
+          |> update_counter(:late_releases_after_abandonment, 1)
+
+        {:noreply, state}
+
+      :explicit ->
         {:noreply, update_counter(state, :duplicate_releases, 1)}
+
+      nil ->
+        case Map.fetch(state.leases, token) do
+          {:ok, %{status: :active} = entry} ->
+            if MapSet.member?(entry.holders, holder) do
+              {entry, state} = clear_pending_retain(holder, entry, state)
+
+              state =
+                state
+                |> update_counter(:explicit_releases, 1)
+                |> put_release_tombstone(holder_id, :explicit)
+
+              remove_holder(token, holder, entry, state)
+            else
+              {:noreply, update_counter(state, :unclassified_releases, 1)}
+            end
+
+          _other ->
+            {:noreply, update_counter(state, :unclassified_releases, 1)}
+        end
     end
   end
 
@@ -433,6 +550,7 @@ defmodule VideoInterop.LeaseOwner do
              :video_interop_confirm_retain,
              :video_interop_cancel_retain,
              :video_interop_release,
+             :video_interop_abandoned,
              :video_interop_drain,
              :video_interop_cancel_drain,
              :video_interop_retry_release
@@ -544,22 +662,39 @@ defmodule VideoInterop.LeaseOwner do
             {:noreply, state}
 
           true ->
-            monitor_ref = Process.monitor(reply_to)
+            case create_abandonment_guard(
+                   state.abandonment_guard_factory,
+                   token,
+                   child_holder
+                 ) do
+              {:ok, child_guard} ->
+                monitor_ref = Process.monitor(reply_to)
 
-            entry = %{
-              entry
-              | holders: MapSet.put(entry.holders, child_holder),
-                pending_retains:
-                  Map.put(entry.pending_retains, child_holder, {monitor_ref, request_ref})
-            }
+                entry = %{
+                  entry
+                  | holders: MapSet.put(entry.holders, child_holder),
+                    pending_retains:
+                      Map.put(entry.pending_retains, child_holder, {monitor_ref, request_ref})
+                }
 
-            state =
-              state
-              |> put_in([:leases, token], entry)
-              |> put_in([:protocol_monitors, monitor_ref], {:retain, token, child_holder})
+                state =
+                  state
+                  |> put_in([:leases, token], entry)
+                  |> put_in([:protocol_monitors, monitor_ref], {:retain, token, child_holder})
+                  |> update_counter(:issued_holders, 1)
 
-            reply_retain(reply_to, request_ref, :ok)
-            {:noreply, state}
+                reply_retain(reply_to, request_ref, {:ok, child_guard})
+                continue_after_guard_reply(child_guard, state)
+
+              {:error, reason} ->
+                reply_retain(
+                  reply_to,
+                  request_ref,
+                  {:error, {:abandonment_guard_factory_failed, reason}}
+                )
+
+                {:noreply, state}
+            end
         end
 
       {:ok, _entry} ->
@@ -595,9 +730,15 @@ defmodule VideoInterop.LeaseOwner do
     end
   end
 
-  defp reject_issue(reason, backend_token, metadata, reply_to, request_ref, state) do
-    token = make_ref()
-
+  defp reject_issue(
+         reason,
+         backend_token,
+         metadata,
+         reply_to,
+         request_ref,
+         state,
+         token \\ make_ref()
+       ) do
     entry = %{
       backend_token: backend_token,
       holders: MapSet.new(),
@@ -758,6 +899,8 @@ defmodule VideoInterop.LeaseOwner do
 
   defp complete_drain(state) do
     state = reply_all_drain_waiters(:ok, state)
+    final_stats = stats_snapshot(state)
+    notify(state.notify, {:video_interop_lease_owner_final_stats, self(), final_stats})
     notify_drained(state)
     state
   end
@@ -875,6 +1018,17 @@ defmodule VideoInterop.LeaseOwner do
     end
   end
 
+  @impl true
+  def handle_continue(:discard_published_guard_reply, state) do
+    # Sending a resource term copies it into the recipient's message queue, but the sender's
+    # process heap can keep its copy until a later garbage collection. Run this continuation
+    # before accepting the confirmation/cancellation message so the LeaseOwner never acts as an
+    # accidental guard custodian after publication. A continuation is used rather than collecting
+    # inside the publishing callback, where the guard is still a live stack term.
+    true = :erlang.garbage_collect(self())
+    {:noreply, state}
+  end
+
   defp reply_issue(reply_to, request_ref, result) do
     reply_via_alias(reply_to, request_ref, {:video_interop_issued, request_ref, result})
   end
@@ -887,13 +1041,18 @@ defmodule VideoInterop.LeaseOwner do
     )
   end
 
-  defp reply_via_alias(reply_to, request_ref, message) do
+  defp reply_via_alias(_reply_to, request_ref, message) do
     try do
       send(request_ref, message)
     rescue
-      ArgumentError -> send(reply_to, message)
+      ArgumentError -> :ok
     end
   end
+
+  defp continue_after_guard_reply(%AbandonmentGuard{}, state),
+    do: {:noreply, state, {:continue, :discard_published_guard_reply}}
+
+  defp continue_after_guard_reply(nil, state), do: {:noreply, state}
 
   defp capacity_available?(%{max_active: :infinity}), do: true
   defp capacity_available?(state), do: map_size(state.leases) < state.max_active
@@ -924,6 +1083,8 @@ defmodule VideoInterop.LeaseOwner do
       active_leases: map_size(state.leases),
       active_holders: active_holders,
       oldest_lease_age_ns: oldest_lease_age_ns,
+      release_tombstones: map_size(state.release_tombstones),
+      release_tombstone_limit: @release_tombstone_limit,
       drain_waiters: map_size(state.drain_waiters),
       message_queue_len: queue_len
     })
@@ -931,6 +1092,86 @@ defmodule VideoInterop.LeaseOwner do
 
   defp update_counter(state, key, value, combine \\ &Kernel.+/2) do
     update_in(state.counters[key], &combine.(&1, value))
+  end
+
+  defp put_release_tombstone(state, holder_id, classification) do
+    if Map.has_key?(state.release_tombstones, holder_id) do
+      put_in(state.release_tombstones[holder_id], classification)
+    else
+      state = %{
+        state
+        | release_tombstones: Map.put(state.release_tombstones, holder_id, classification),
+          release_tombstone_order: :queue.in(holder_id, state.release_tombstone_order)
+      }
+
+      evict_release_tombstones(state)
+    end
+  end
+
+  defp evict_release_tombstones(state)
+       when map_size(state.release_tombstones) <= @release_tombstone_limit,
+       do: state
+
+  defp evict_release_tombstones(state) do
+    {{:value, holder_id}, release_tombstone_order} =
+      :queue.out(state.release_tombstone_order)
+
+    {classification, release_tombstones} = Map.pop!(state.release_tombstones, holder_id)
+
+    state = %{
+      state
+      | release_tombstones: release_tombstones,
+        release_tombstone_order: release_tombstone_order
+    }
+
+    state = update_counter(state, :release_tombstone_evictions, 1)
+
+    if classification == :abandoned do
+      update_counter(state, :abandonment_tombstone_evictions, 1)
+    else
+      state
+    end
+  end
+
+  defp create_abandonment_guard(nil, _token, _holder), do: {:ok, nil}
+
+  defp create_abandonment_guard(factory, token, holder) do
+    result =
+      try do
+        case factory do
+          function when is_function(function, 3) ->
+            function.(self(), token, holder)
+
+          {module, function, arguments} ->
+            apply(module, function, [self(), token, holder | arguments])
+        end
+      rescue
+        error -> {:exception, error, __STACKTRACE__}
+      catch
+        kind, reason -> {kind, reason}
+      end
+
+    case result do
+      {:ok, %AbandonmentGuard{} = guard} ->
+        if AbandonmentGuard.valid?(guard),
+          do: {:ok, guard},
+          else: {:error, {:invalid_guard, guard}}
+
+      {:ok, guard} ->
+        {:error, {:invalid_guard, guard}}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      {:exception, error, stacktrace} ->
+        {:error, {:exception, error, stacktrace}}
+
+      {kind, reason} when kind in [:exit, :throw] ->
+        {:error, {kind, reason}}
+
+      other ->
+        {:error, {:invalid_factory_result, other}}
+    end
   end
 
   defp notify_drained(state) do
@@ -952,7 +1193,15 @@ defmodule VideoInterop.LeaseOwner do
 
   defp normalize_retry_policy(other), do: other
 
-  defp validate_options!(producer, release, max_active, notify, notify_releases, retry) do
+  defp validate_options!(
+         producer,
+         release,
+         max_active,
+         notify,
+         notify_releases,
+         retry,
+         abandonment_guard_factory
+       ) do
     unless is_pid(producer) and node(producer) == node() do
       raise ArgumentError, "producer must be a local PID"
     end
@@ -976,6 +1225,12 @@ defmodule VideoInterop.LeaseOwner do
     unless valid_retry_policy?(retry) do
       raise ArgumentError,
             "release_retry must be :manual or {:exponential, initial_ms: ..., max_ms: ..., max_attempts: ...}"
+    end
+
+    unless is_nil(abandonment_guard_factory) or
+             is_function(abandonment_guard_factory, 3) or valid_mfa?(abandonment_guard_factory) do
+      raise ArgumentError,
+            "abandonment_guard_factory must be nil, a three-argument function, or {module, function, args}"
     end
   end
 
