@@ -37,6 +37,12 @@ optimal `R8_UNORM`/`R8G8_UNORM` storage and filtered sampling are available, a
 defers range/matrix/siting conversion to the renderer; otherwise a 2×2 RGBA
 compute fallback remains available.
 
+Packed RGBA/BGRA imports are also persistent. Callers select the exact Vulkan byte order,
+publish the complete DMA-BUF allocation size, and provide one-plane offset/pitch topology.
+The importer rejects undersized allocations against both the packed span and Vulkan image-memory
+requirements, caches by stream incarnation plus DMA-BUF identity and complete topology, rejects
+active reuse/collisions, and evicts only idle entries.
+
 NV12 source imports are persistently cached by stream incarnation, DMA-BUF
 `(st_dev, st_ino)`, complete allocation size, modifier, and exact plane topology.
 Active reappearance and topology collisions fail closed, eviction is idle-only,

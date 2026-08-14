@@ -31,7 +31,29 @@ pub const IMPORTED_RGBA_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 pub const IMPORTED_SCANOUT_BGRA_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 pub const IMPORTED_NV12_FORMAT: vk::Format = vk::Format::G8_B8R8_2PLANE_420_UNORM;
 
-const DIRECT_RGBA_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PackedImageFormat {
+    Rgba8888,
+    Bgra8888,
+}
+
+impl PackedImageFormat {
+    fn vk_format(self) -> vk::Format {
+        match self {
+            Self::Rgba8888 => IMPORTED_RGBA_FORMAT,
+            Self::Bgra8888 => IMPORTED_SCANOUT_BGRA_FORMAT,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rgba8888 => "R8G8B8A8",
+            Self::Bgra8888 => "B8G8R8A8",
+        }
+    }
+}
+
+const DIRECT_PACKED_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
     vk::ImageUsageFlags::SAMPLED.as_raw()
         | vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw()
         | vk::ImageUsageFlags::TRANSFER_SRC.as_raw()
@@ -54,6 +76,7 @@ const STAGED_NV12_LUMA_FORMAT: vk::Format = vk::Format::R8_UNORM;
 const STAGED_NV12_CHROMA_FORMAT: vk::Format = vk::Format::R8G8_UNORM;
 const DEFAULT_NV12_SOURCE_CACHE_ENTRIES: usize = 32;
 const DEFAULT_NV12_OUTPUT_SLOTS: usize = 8;
+const DEFAULT_PACKED_SOURCE_CACHE_ENTRIES: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VulkanImportPoolLimits {
@@ -89,6 +112,17 @@ pub trait VulkanDeviceContext: Send + Sync + 'static {
 pub struct ImportedPlane {
     pub offset: u64,
     pub pitch: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PackedImageImport {
+    pub stream_incarnation: u64,
+    pub dimensions: (u32, u32),
+    pub source_fd: i32,
+    pub source_size: u64,
+    pub modifier: u64,
+    pub plane: ImportedPlane,
+    pub format: PackedImageFormat,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -529,6 +563,119 @@ impl<D: VulkanDeviceContext> Nv12SourceCache<D> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct PackedSourceTopology {
+    dimensions: (u32, u32),
+    object_size: u64,
+    modifier: u64,
+    plane: ImportedPlane,
+    format: PackedImageFormat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct PackedSourceCacheKey {
+    stream_incarnation: u64,
+    device: u64,
+    inode: u64,
+    topology: PackedSourceTopology,
+}
+
+struct CachedPackedSource<D: VulkanDeviceContext> {
+    allocation: ImageAllocation<D>,
+    format: PackedImageFormat,
+    claimed: AtomicBool,
+    last_used: AtomicU64,
+}
+
+impl<D: VulkanDeviceContext> CachedPackedSource<D> {
+    fn claim(self: &Arc<Self>, generation: u64) -> Result<PackedSourceLease<D>, String> {
+        self.claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                "cached packed DMA-BUF reappeared before its previous lease completed".to_string()
+            })?;
+        self.last_used.store(generation, Ordering::Release);
+        Ok(PackedSourceLease {
+            source: Arc::clone(self),
+            released: AtomicBool::new(false),
+        })
+    }
+}
+
+struct PackedSourceLease<D: VulkanDeviceContext> {
+    source: Arc<CachedPackedSource<D>>,
+    released: AtomicBool,
+}
+
+impl<D: VulkanDeviceContext> PackedSourceLease<D> {
+    fn release(&self) {
+        if !self.released.swap(true, Ordering::AcqRel) {
+            let was_claimed = self.source.claimed.swap(false, Ordering::AcqRel);
+            debug_assert!(was_claimed, "packed source cache claim released twice");
+        }
+    }
+}
+
+impl<D: VulkanDeviceContext> Drop for PackedSourceLease<D> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+struct PackedSourceCache<D: VulkanDeviceContext> {
+    entries: HashMap<PackedSourceCacheKey, Arc<CachedPackedSource<D>>>,
+    max_entries: usize,
+}
+
+impl<D: VulkanDeviceContext> PackedSourceCache<D> {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_entries,
+        }
+    }
+
+    fn evict_one_idle(&mut self) -> bool {
+        let idle = self
+            .entries
+            .iter()
+            .filter(|(_, source)| {
+                !source.claimed.load(Ordering::Acquire) && Arc::strong_count(source) == 1
+            })
+            .min_by_key(|(_, source)| source.last_used.load(Ordering::Acquire))
+            .map(|(key, _)| *key);
+        idle.is_some_and(|key| self.entries.remove(&key).is_some())
+    }
+
+    fn evict_stream(&mut self, stream_incarnation: u64) -> (usize, usize) {
+        let before = self.entries.len();
+        self.entries.retain(|key, source| {
+            key.stream_incarnation != stream_incarnation
+                || source.claimed.load(Ordering::Acquire)
+                || Arc::strong_count(source) > 1
+        });
+        let evicted = before.saturating_sub(self.entries.len());
+        let retained = self
+            .entries
+            .keys()
+            .filter(|key| key.stream_incarnation == stream_incarnation)
+            .count();
+        (evicted, retained)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PackedImportCacheStats {
+    pub source_entries: usize,
+    pub active_sources: usize,
+    pub source_cache_hits: u64,
+    pub source_cache_misses: u64,
+    pub source_cache_evictions: u64,
+    pub source_active_reuse_rejections: u64,
+    pub source_topology_collisions: u64,
+    pub allocation_size_rejections: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Nv12ImportCacheStats {
     pub source_entries: usize,
@@ -559,6 +706,7 @@ pub struct VulkanDmaBufImporter<D: VulkanDeviceContext> {
     // Pools must drop before the descriptor-set layouts owned by their pipelines.
     nv12_output_pool: Mutex<Nv12OutputPool<D>>,
     nv12_source_cache: Mutex<Nv12SourceCache<D>>,
+    packed_source_cache: Mutex<PackedSourceCache<D>>,
     nv12_rgba_compute: Option<Arc<Nv12ComputePipeline<D>>>,
     nv12_planar_compute: Option<Arc<Nv12ComputePipeline<D>>>,
     source_cache_hits: AtomicU64,
@@ -568,6 +716,13 @@ pub struct VulkanDmaBufImporter<D: VulkanDeviceContext> {
     source_topology_collisions: AtomicU64,
     output_pool_busy_rejections: AtomicU64,
     source_cache_clock: AtomicU64,
+    packed_source_cache_hits: AtomicU64,
+    packed_source_cache_misses: AtomicU64,
+    packed_source_cache_evictions: AtomicU64,
+    packed_source_active_reuse_rejections: AtomicU64,
+    packed_source_topology_collisions: AtomicU64,
+    packed_allocation_size_rejections: AtomicU64,
+    packed_source_cache_clock: AtomicU64,
 }
 
 impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
@@ -622,6 +777,9 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
             nv12_capabilities,
             nv12_output_pool: Mutex::new(Nv12OutputPool::new(limits.nv12_output_slots)),
             nv12_source_cache: Mutex::new(Nv12SourceCache::new(limits.nv12_source_cache_entries)),
+            packed_source_cache: Mutex::new(PackedSourceCache::new(
+                DEFAULT_PACKED_SOURCE_CACHE_ENTRIES,
+            )),
             nv12_rgba_compute,
             nv12_planar_compute,
             source_cache_hits: AtomicU64::new(0),
@@ -631,6 +789,13 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
             source_topology_collisions: AtomicU64::new(0),
             output_pool_busy_rejections: AtomicU64::new(0),
             source_cache_clock: AtomicU64::new(1),
+            packed_source_cache_hits: AtomicU64::new(0),
+            packed_source_cache_misses: AtomicU64::new(0),
+            packed_source_cache_evictions: AtomicU64::new(0),
+            packed_source_active_reuse_rejections: AtomicU64::new(0),
+            packed_source_topology_collisions: AtomicU64::new(0),
+            packed_allocation_size_rejections: AtomicU64::new(0),
+            packed_source_cache_clock: AtomicU64::new(1),
         })
     }
 
@@ -642,20 +807,201 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
         &self.nv12_capabilities
     }
 
-    pub fn import_rgba(
+    pub fn import_packed(
         &self,
-        dimensions: (u32, u32),
-        source_fd: i32,
-        modifier: u64,
-        plane: ImportedPlane,
+        request: PackedImageImport,
     ) -> Result<ImportedDmaBufImage<D>, String> {
-        ImportedDmaBufImage::new_rgba(
+        self.claim_cached_packed_source(request).map(|source| {
+            ImportedDmaBufImage::from_packed_source(request.dimensions, request.modifier, source)
+        })
+    }
+
+    pub fn evict_packed_stream(&self, stream_incarnation: u64) -> Result<(), String> {
+        let (evicted, retained) = self
+            .packed_source_cache
+            .lock()
+            .map_err(|_| "Vulkan packed source-cache lock poisoned".to_string())?
+            .evict_stream(stream_incarnation);
+        self.packed_source_cache_evictions
+            .fetch_add(evicted as u64, Ordering::Relaxed);
+        if retained == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "Vulkan packed stream {stream_incarnation} still owns {retained} active cached source(s)"
+            ))
+        }
+    }
+
+    pub fn packed_cache_stats(&self) -> Result<PackedImportCacheStats, String> {
+        let cache = self
+            .packed_source_cache
+            .lock()
+            .map_err(|_| "Vulkan packed source-cache lock poisoned".to_string())?;
+        Ok(PackedImportCacheStats {
+            source_entries: cache.entries.len(),
+            active_sources: cache
+                .entries
+                .values()
+                .filter(|source| source.claimed.load(Ordering::Acquire))
+                .count(),
+            source_cache_hits: self.packed_source_cache_hits.load(Ordering::Relaxed),
+            source_cache_misses: self.packed_source_cache_misses.load(Ordering::Relaxed),
+            source_cache_evictions: self.packed_source_cache_evictions.load(Ordering::Relaxed),
+            source_active_reuse_rejections: self
+                .packed_source_active_reuse_rejections
+                .load(Ordering::Relaxed),
+            source_topology_collisions: self
+                .packed_source_topology_collisions
+                .load(Ordering::Relaxed),
+            allocation_size_rejections: self
+                .packed_allocation_size_rejections
+                .load(Ordering::Relaxed),
+        })
+    }
+
+    fn claim_cached_packed_source(
+        &self,
+        request: PackedImageImport,
+    ) -> Result<PackedSourceLease<D>, String> {
+        let PackedImageImport {
+            stream_incarnation,
+            dimensions,
+            source_fd,
+            source_size,
+            modifier,
+            plane,
+            format,
+        } = request;
+        validate_image_inputs(dimensions, source_fd, plane)?;
+        if let Err(error) = validate_packed_layout(dimensions, source_size, plane) {
+            if error.starts_with("DMA-BUF object size ") {
+                self.packed_allocation_size_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            return Err(error);
+        }
+        validate_packed_import_support(self.device.as_ref(), format, modifier)?;
+        let (device, inode) = dmabuf_identity(source_fd)?;
+        let topology = PackedSourceTopology {
+            dimensions,
+            object_size: source_size,
+            modifier,
+            plane,
+            format,
+        };
+        let key = PackedSourceCacheKey {
+            stream_incarnation,
+            device,
+            inode,
+            topology,
+        };
+        let generation = self
+            .packed_source_cache_clock
+            .fetch_add(1, Ordering::Relaxed);
+        {
+            let cache = self
+                .packed_source_cache
+                .lock()
+                .map_err(|_| "Vulkan packed source-cache lock poisoned".to_string())?;
+            if let Some(source) = cache.entries.get(&key) {
+                return match source.claim(generation) {
+                    Ok(lease) => {
+                        self.packed_source_cache_hits
+                            .fetch_add(1, Ordering::Relaxed);
+                        Ok(lease)
+                    }
+                    Err(error) => {
+                        self.packed_source_active_reuse_rejections
+                            .fetch_add(1, Ordering::Relaxed);
+                        Err(error)
+                    }
+                };
+            }
+            if cache.entries.keys().any(|existing| {
+                existing.stream_incarnation == stream_incarnation
+                    && existing.device == device
+                    && existing.inode == inode
+                    && existing.topology != topology
+            }) {
+                self.packed_source_topology_collisions
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(
+                    "cached packed DMA-BUF identity reappeared with different topology".to_string(),
+                );
+            }
+        }
+
+        self.packed_source_cache_misses
+            .fetch_add(1, Ordering::Relaxed);
+        let allocation = match create_direct_image(
             Arc::clone(&self.device),
             dimensions,
             source_fd,
             modifier,
-            plane,
-        )
+            &[plane],
+            format.vk_format(),
+            DIRECT_PACKED_USAGE,
+            Some(source_size),
+        ) {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                if error.starts_with("DMA-BUF object size ") {
+                    self.packed_allocation_size_rejections
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return Err(error);
+            }
+        };
+        let source = Arc::new(CachedPackedSource {
+            allocation,
+            format,
+            claimed: AtomicBool::new(false),
+            last_used: AtomicU64::new(generation),
+        });
+        let mut cache = self
+            .packed_source_cache
+            .lock()
+            .map_err(|_| "Vulkan packed source-cache lock poisoned".to_string())?;
+        if let Some(existing) = cache.entries.get(&key) {
+            return match existing.claim(generation) {
+                Ok(lease) => {
+                    self.packed_source_cache_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                    Ok(lease)
+                }
+                Err(error) => {
+                    self.packed_source_active_reuse_rejections
+                        .fetch_add(1, Ordering::Relaxed);
+                    Err(error)
+                }
+            };
+        }
+        if cache.entries.keys().any(|existing| {
+            existing.stream_incarnation == stream_incarnation
+                && existing.device == device
+                && existing.inode == inode
+                && existing.topology != topology
+        }) {
+            self.packed_source_topology_collisions
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(
+                "cached packed DMA-BUF identity reappeared with different topology".to_string(),
+            );
+        }
+        if cache.entries.len() >= cache.max_entries && cache.evict_one_idle() {
+            self.packed_source_cache_evictions
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if cache.entries.len() >= cache.max_entries {
+            return Err(format!(
+                "Vulkan packed source cache is saturated at {} entries",
+                cache.max_entries
+            ));
+        }
+        let lease = source.claim(generation)?;
+        cache.entries.insert(key, source);
+        Ok(lease)
     }
 
     pub fn import_nv12_shared_object(
@@ -838,6 +1184,18 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
                     Err(error)
                 }
             };
+        }
+        if cache.entries.keys().any(|existing| {
+            existing.stream_incarnation == stream_incarnation
+                && existing.device == device_id
+                && existing.inode == inode
+                && existing.topology != topology
+        }) {
+            self.source_topology_collisions
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(
+                "cached NV12 DMA-BUF identity reappeared with different topology".to_string(),
+            );
         }
         if cache.entries.len() >= cache.max_entries && cache.evict_one_idle() {
             self.source_cache_evictions.fetch_add(1, Ordering::Relaxed);
@@ -1131,7 +1489,7 @@ struct StagedNv12<D: VulkanDeviceContext> {
 }
 
 enum ImportedKind<D: VulkanDeviceContext> {
-    DirectRgba(ImageAllocation<D>),
+    DirectPacked(PackedSourceLease<D>),
     DirectBgraScanout(ImageAllocation<D>),
     DirectNv12(ImageAllocation<D>, DirectNv12Sampling),
     StagedNv12(StagedNv12<D>),
@@ -1181,32 +1539,18 @@ impl<D: VulkanDeviceContext> ImportedDmaBufImage<D> {
         })
     }
 
-    pub fn new_rgba(
-        device: Arc<D>,
+    fn from_packed_source(
         dimensions: (u32, u32),
-        source_fd: i32,
         modifier: u64,
-        plane: ImportedPlane,
-    ) -> Result<Self, String> {
-        validate_image_inputs(dimensions, source_fd, plane)?;
-        validate_rgba_import_support(device.as_ref(), modifier)?;
-        let sampled = create_direct_image(
-            Arc::clone(&device),
-            dimensions,
-            source_fd,
-            modifier,
-            &[plane],
-            IMPORTED_RGBA_FORMAT,
-            DIRECT_RGBA_USAGE,
-            None,
-        )?;
-        Ok(Self {
-            kind: ImportedKind::DirectRgba(sampled),
+        source: PackedSourceLease<D>,
+    ) -> Self {
+        Self {
+            kind: ImportedKind::DirectPacked(source),
             dimensions,
             modifier,
-            sampled_usage: DIRECT_RGBA_USAGE,
+            sampled_usage: DIRECT_PACKED_USAGE,
             sampled_tiling: vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT,
-        })
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1255,9 +1599,10 @@ impl<D: VulkanDeviceContext> ImportedDmaBufImage<D> {
 
     pub fn image(&self) -> vk::Image {
         match &self.kind {
-            ImportedKind::DirectRgba(sampled)
-            | ImportedKind::DirectBgraScanout(sampled)
-            | ImportedKind::DirectNv12(sampled, _) => sampled.image,
+            ImportedKind::DirectPacked(source) => source.source.allocation.image,
+            ImportedKind::DirectBgraScanout(sampled) | ImportedKind::DirectNv12(sampled, _) => {
+                sampled.image
+            }
             ImportedKind::StagedNv12(staged) => match staged.output.slot.sampled_images() {
                 StagedSampledImages::Rgba { image } => image,
                 StagedSampledImages::YuvPlanes { luma, .. } => luma,
@@ -1267,9 +1612,10 @@ impl<D: VulkanDeviceContext> ImportedDmaBufImage<D> {
 
     pub fn device(&self) -> &D {
         match &self.kind {
-            ImportedKind::DirectRgba(sampled)
-            | ImportedKind::DirectBgraScanout(sampled)
-            | ImportedKind::DirectNv12(sampled, _) => sampled.device.as_ref(),
+            ImportedKind::DirectPacked(source) => source.source.allocation.device.as_ref(),
+            ImportedKind::DirectBgraScanout(sampled) | ImportedKind::DirectNv12(sampled, _) => {
+                sampled.device.as_ref()
+            }
             ImportedKind::StagedNv12(staged) => staged.output.slot.device.as_ref(),
         }
     }
@@ -1292,7 +1638,10 @@ impl<D: VulkanDeviceContext> ImportedDmaBufImage<D> {
 
     pub fn sampled_format(&self) -> SampledImageFormat {
         match &self.kind {
-            ImportedKind::DirectRgba(_) => SampledImageFormat::Rgba8888,
+            ImportedKind::DirectPacked(source) => match source.source.format {
+                PackedImageFormat::Rgba8888 => SampledImageFormat::Rgba8888,
+                PackedImageFormat::Bgra8888 => SampledImageFormat::Bgra8888,
+            },
             ImportedKind::DirectBgraScanout(_) => SampledImageFormat::Bgra8888,
             ImportedKind::DirectNv12(_, _) => SampledImageFormat::Nv12,
             ImportedKind::StagedNv12(staged) => match staged.output.slot.resources {
@@ -1365,11 +1714,14 @@ impl<D: VulkanDeviceContext> ImportedDmaBufImage<D> {
                 push_constants: staged.push_constants,
                 dimensions: self.dimensions,
             }),
-            ImportedKind::DirectRgba(sampled)
-            | ImportedKind::DirectBgraScanout(sampled)
-            | ImportedKind::DirectNv12(sampled, _) => AcquirePlan::DirectImage {
-                image: sampled.image,
+            ImportedKind::DirectPacked(source) => AcquirePlan::DirectImage {
+                image: source.source.allocation.image,
             },
+            ImportedKind::DirectBgraScanout(sampled) | ImportedKind::DirectNv12(sampled, _) => {
+                AcquirePlan::DirectImage {
+                    image: sampled.image,
+                }
+            }
         }
     }
 }
@@ -1896,6 +2248,40 @@ fn create_staged_nv12<D: VulkanDeviceContext>(
     })
 }
 
+fn validate_packed_layout(
+    dimensions: (u32, u32),
+    source_size: u64,
+    plane: ImportedPlane,
+) -> Result<(), String> {
+    if source_size == 0 {
+        return Err("Vulkan packed import has a zero allocation size".to_string());
+    }
+    let row_bytes = u64::from(dimensions.0)
+        .checked_mul(4)
+        .ok_or_else(|| "Vulkan packed row size overflow".to_string())?;
+    if u64::from(plane.pitch) < row_bytes {
+        return Err(format!(
+            "Vulkan packed image pitch {} is smaller than row size {row_bytes}",
+            plane.pitch
+        ));
+    }
+    let required = plane
+        .offset
+        .checked_add(
+            u64::from(plane.pitch)
+                .checked_mul(u64::from(dimensions.1.saturating_sub(1)))
+                .ok_or_else(|| "Vulkan packed image extent overflow".to_string())?,
+        )
+        .and_then(|last_row| last_row.checked_add(row_bytes))
+        .ok_or_else(|| "Vulkan packed image extent overflow".to_string())?;
+    if required > source_size {
+        return Err(format!(
+            "DMA-BUF object size {source_size} is smaller than packed image span {required}"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_image_inputs(
     dimensions: (u32, u32),
     source_fd: i32,
@@ -2226,21 +2612,29 @@ pub fn validate_bgra_scanout_import_support<D: VulkanDeviceContext>(
     )
 }
 
-pub fn validate_rgba_import_support<D: VulkanDeviceContext>(
+pub fn validate_packed_import_support<D: VulkanDeviceContext>(
     device: &D,
+    format: PackedImageFormat,
     modifier: u64,
 ) -> Result<(), String> {
     validate_direct_modifier(
         device,
-        IMPORTED_RGBA_FORMAT,
+        format.vk_format(),
         modifier,
-        DIRECT_RGBA_USAGE,
+        DIRECT_PACKED_USAGE,
         vk::FormatFeatureFlags::SAMPLED_IMAGE
             | vk::FormatFeatureFlags::TRANSFER_SRC
             | vk::FormatFeatureFlags::TRANSFER_DST
             | vk::FormatFeatureFlags::COLOR_ATTACHMENT,
-        "R8G8B8A8",
+        format.label(),
     )
+}
+
+pub fn validate_rgba_import_support<D: VulkanDeviceContext>(
+    device: &D,
+    modifier: u64,
+) -> Result<(), String> {
+    validate_packed_import_support(device, PackedImageFormat::Rgba8888, modifier)
 }
 
 fn validate_direct_modifier<D: VulkanDeviceContext>(
@@ -2621,6 +3015,68 @@ mod tests {
             range: ColorRange::Limited,
             chroma_location,
         }
+    }
+
+    #[test]
+    fn packed_formats_map_to_exact_vulkan_byte_orders_and_topology_keys() {
+        assert_eq!(
+            PackedImageFormat::Rgba8888.vk_format().as_raw(),
+            vk::Format::R8G8B8A8_UNORM.as_raw()
+        );
+        assert_eq!(
+            PackedImageFormat::Bgra8888.vk_format().as_raw(),
+            vk::Format::B8G8R8A8_UNORM.as_raw()
+        );
+        let base = PackedSourceTopology {
+            dimensions: (64, 32),
+            object_size: 8_192,
+            modifier: DRM_FORMAT_MOD_LINEAR,
+            plane: ImportedPlane {
+                offset: 0,
+                pitch: 256,
+            },
+            format: PackedImageFormat::Bgra8888,
+        };
+        assert_ne!(
+            base,
+            PackedSourceTopology {
+                object_size: 8_448,
+                ..base
+            }
+        );
+        assert_ne!(
+            base,
+            PackedSourceTopology {
+                format: PackedImageFormat::Rgba8888,
+                ..base
+            }
+        );
+    }
+
+    #[test]
+    fn packed_layout_requires_exact_pitch_and_truthful_object_span() {
+        let plane = ImportedPlane {
+            offset: 64,
+            pitch: 256,
+        };
+        assert!(validate_packed_layout((64, 32), 8_256, plane).is_ok());
+        assert!(
+            validate_packed_layout((64, 32), 8_255, plane)
+                .unwrap_err()
+                .contains("smaller than packed image span")
+        );
+        assert!(
+            validate_packed_layout(
+                (64, 32),
+                8_256,
+                ImportedPlane {
+                    offset: 64,
+                    pitch: 255,
+                },
+            )
+            .unwrap_err()
+            .contains("pitch")
+        );
     }
 
     #[test]
