@@ -4,6 +4,12 @@ defmodule VideoInterop.RustSchemaTest do
   alias VideoInterop.{Frame, Lease, Rect, SchemaConsumerNative, SchemaNative, SyncFile}
   alias VideoInterop.DMABuf.{Descriptor, FourCC, Layer, Object, Plane}
 
+  test "test NIFs are isolated from the application's priv directory" do
+    native_dir = Application.app_dir(:video_interop, "priv/native")
+
+    assert Path.wildcard(Path.join(native_dir, "video_interop_schema_*test.*")) == []
+  end
+
   test "Rustler decodes the published descriptor schema" do
     assert SchemaNative.inspect_descriptor(descriptor(10)) ==
              {:ok, {1, 1, 1, FourCC.nv12(), 0, 2}}

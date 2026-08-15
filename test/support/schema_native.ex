@@ -1,10 +1,12 @@
 defmodule VideoInterop.SchemaNative do
   @moduledoc false
 
-  use Rustler,
-    otp_app: :video_interop,
-    crate: "video_interop_schema_test",
-    path: "test/native/schema_test"
+  @on_load :load_nif
+  @nif_path Path.expand("../../target/schema-fixtures/video_interop_schema_test", __DIR__)
+
+  def load_nif do
+    :erlang.load_nif(String.to_charlist(@nif_path), 0)
+  end
 
   def inspect_descriptor(_descriptor), do: :erlang.nif_error(:nif_not_loaded)
   def inspect_frame(_frame), do: :erlang.nif_error(:nif_not_loaded)

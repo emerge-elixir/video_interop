@@ -1,10 +1,15 @@
 defmodule VideoInterop.SchemaConsumerNative do
   @moduledoc false
 
-  use Rustler,
-    otp_app: :video_interop,
-    crate: "video_interop_schema_consumer_test",
-    path: "test/native/schema_consumer_test"
+  @on_load :load_nif
+  @nif_path Path.expand(
+              "../../target/schema-fixtures/video_interop_schema_consumer_test",
+              __DIR__
+            )
+
+  def load_nif do
+    :erlang.load_nif(String.to_charlist(@nif_path), 0)
+  end
 
   def start_dispatcher(), do: :erlang.nif_error(:nif_not_loaded)
   def shutdown_dispatcher(_owner), do: :erlang.nif_error(:nif_not_loaded)

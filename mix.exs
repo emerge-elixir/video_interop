@@ -18,24 +18,21 @@ defmodule VideoInterop.MixProject do
   end
 
   defp aliases do
-    [test: [&test_without_schema_artifact/1]]
+    [test: [&test_with_schema_artifacts/1]]
   end
 
-  defp test_without_schema_artifact(args) do
+  defp test_with_schema_artifacts(args) do
     stage_schema_fixtures!()
-
-    try do
-      Mix.Tasks.Test.run(args)
-    after
-      cleanup_schema_fixtures()
-    end
+    Mix.Tasks.Test.run(args)
   end
 
   defp stage_schema_fixtures! do
     fixtures = ["video_interop_schema_test", "video_interop_schema_consumer_test"]
     cargo_args = ["build", "--release"] ++ Enum.flat_map(fixtures, &["-p", &1])
-
     target_dir = Path.join(__DIR__, "target")
+    fixture_dir = Path.join(target_dir, "schema-fixtures")
+
+    remove_legacy_schema_fixtures!()
 
     case System.cmd("cargo", cargo_args,
            cd: __DIR__,
@@ -46,21 +43,21 @@ defmodule VideoInterop.MixProject do
       {output, status} -> Mix.raise("schema fixture build failed (#{status}):\n#{output}")
     end
 
-    File.mkdir_p!(Path.join([__DIR__, "priv", "native"]))
+    File.mkdir_p!(fixture_dir)
 
     Enum.each(fixtures, fn fixture ->
-      source = Path.join([__DIR__, "target", "release", cargo_library_name(fixture)])
-      destination = Path.join([__DIR__, "priv", "native", nif_library_name(fixture)])
+      source = Path.join([target_dir, "release", cargo_library_name(fixture)])
+      destination = Path.join(fixture_dir, nif_library_name(fixture))
       File.rm(destination)
       File.cp!(source, destination)
     end)
   end
 
-  defp cleanup_schema_fixtures do
+  defp remove_legacy_schema_fixtures! do
     [__DIR__, "priv", "native", "video_interop_schema_*test.*"]
     |> Path.join()
     |> Path.wildcard()
-    |> Enum.each(&File.rm/1)
+    |> Enum.each(&File.rm!/1)
   end
 
   defp cargo_library_name(fixture) do
