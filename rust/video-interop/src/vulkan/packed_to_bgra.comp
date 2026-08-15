@@ -1,0 +1,41 @@
+#version 450
+
+// One invocation copies one packed pixel into an optimal BGRA image. The producer allocation is
+// read only through bounded R32_UINT texel fetches; no transfer-source usage or TFU read touches it.
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform usamplerBuffer source_buffer;
+layout(set = 0, binding = 1, r32ui) writeonly uniform uimage2D output_image;
+
+layout(push_constant) uniform Parameters {
+    uint width;
+    uint height;
+    uint offset;
+    uint pitch;
+    uint source_format;
+} params;
+
+uint load_byte(uint offset) {
+    uint word = texelFetch(source_buffer, int(offset >> 2u)).r;
+    return (word >> ((offset & 3u) * 8u)) & 255u;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(params.width) || pixel.y >= int(params.height)) {
+        return;
+    }
+
+    uint offset = params.offset + uint(pixel.y) * params.pitch + uint(pixel.x) * 4u;
+    uint c0 = load_byte(offset);
+    uint c1 = load_byte(offset + 1u);
+    uint c2 = load_byte(offset + 2u);
+    uint c3 = load_byte(offset + 3u);
+
+    // Packed RGBA memory is R,G,B,A and must be swizzled into B,G,R,A. Packed BGRA/XRGB memory
+    // already has the destination byte order, but XRGB's ignored byte is forced opaque.
+    uint bgra = params.source_format == 0u
+        ? c2 | (c1 << 8u) | (c0 << 16u) | (c3 << 24u)
+        : c0 | (c1 << 8u) | (c2 << 16u) | (255u << 24u);
+    imageStore(output_image, pixel, uvec4(bgra, 0u, 0u, 0u));
+}

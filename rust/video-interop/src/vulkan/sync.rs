@@ -9,8 +9,8 @@ use std::{
 use ash::vk;
 
 use super::{
-    AcquirePlan, ImportedDmaBufImage, Nv12ImportStrategy, StagedAcquirePlan, StagedSampledImages,
-    VulkanDeviceContext, duplicate_import_fd,
+    AcquirePlan, ImportedDmaBufImage, StagedAcquirePlan, StagedSampledImages, VulkanDeviceContext,
+    duplicate_import_fd,
 };
 
 /// DMA-BUF ownership outside this logical Vulkan device. The core external family is used rather
@@ -84,9 +84,9 @@ struct TimestampQuery {
 
 /// One-shot synchronization owner for an imported frame.
 ///
-/// Direct images transition from external `GENERAL` to shader-read and back. Staged NV12 imports
-/// acquire the external source buffer, run the GPU color conversion, return the source buffer to
-/// the external family in the same submission, and expose only the internal sampled image to the
+/// Direct images transition from external `GENERAL` to shader-read and back. Staged imports
+/// acquire the external source buffer, run the GPU copy/conversion, return the source buffer to the
+/// external family in the same submission, and expose only the internal sampled image to the
 /// renderer. The release fence always remains the sole canonical lease-retirement authority.
 pub struct ImportedImageSync<D: VulkanDeviceContext> {
     device: Arc<D>,
@@ -236,7 +236,7 @@ impl<D: VulkanDeviceContext> ImportedImageSync<D> {
         unsafe { self.device.device().reset_fences(&[self.acquire_fence]) }.map_err(|result| {
             ImportedImageSyncError::new(
                 ImportedImageSyncErrorKind::AcquireSubmit,
-                format!("failed to reset staged NV12 source fence: {result:?}"),
+                format!("failed to reset staged source fence: {result:?}"),
             )
         })?;
         if let Err(error) = self.record_acquire(imported.acquire_plan()) {
@@ -298,7 +298,7 @@ impl<D: VulkanDeviceContext> ImportedImageSync<D> {
             AcquirePlan::DirectImage { image } => {
                 record_direct_acquire(self.device.as_ref(), self.acquire_command, image)
             }
-            AcquirePlan::StagedNv12(plan) => record_staged_acquire(
+            AcquirePlan::StagedCompute(plan) => record_staged_acquire(
                 self.device.as_ref(),
                 self.acquire_command,
                 plan,
@@ -323,12 +323,12 @@ impl<D: VulkanDeviceContext> ImportedImageSync<D> {
                 self.device.mark_device_lost();
                 Err(ImportedImageSyncError::device_lost(
                     ImportedImageSyncErrorKind::SourceFencePoll,
-                    "Vulkan device lost while polling staged NV12 source release".to_string(),
+                    "Vulkan device lost while polling staged source release".to_string(),
                 ))
             }
             Err(result) => Err(ImportedImageSyncError::new(
                 ImportedImageSyncErrorKind::SourceFencePoll,
-                format!("failed to poll staged NV12 source-release fence: {result:?}"),
+                format!("failed to poll staged source-release fence: {result:?}"),
             )),
         }
     }
@@ -660,7 +660,7 @@ fn record_direct_acquire<D: VulkanDeviceContext>(
 
 fn staged_output_images(output: StagedSampledImages) -> Vec<vk::Image> {
     match output {
-        StagedSampledImages::Rgba { image } => vec![image],
+        StagedSampledImages::Rgba { image } | StagedSampledImages::Bgra { image } => vec![image],
         StagedSampledImages::YuvPlanes { luma, chroma } => vec![luma, chroma],
     }
 }
@@ -748,17 +748,9 @@ fn record_staged_acquire<D: VulkanDeviceContext>(
             0,
             plan.push_constants.as_bytes(),
         );
-        debug_assert!(matches!(
-            plan.strategy,
-            Nv12ImportStrategy::LinearBufferToRgba | Nv12ImportStrategy::LinearBufferToYuvPlanes
-        ));
-        let block_dimensions = (plan.dimensions.0 / 2, plan.dimensions.1 / 2);
-        device.device().cmd_dispatch(
-            command,
-            block_dimensions.0.div_ceil(16),
-            block_dimensions.1.div_ceil(16),
-            1,
-        );
+        device
+            .device()
+            .cmd_dispatch(command, plan.dispatch.0, plan.dispatch.1, 1);
     }
     let output_releases = staged_output_images(plan.output)
         .into_iter()

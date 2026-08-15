@@ -37,6 +37,15 @@ pub enum PackedImageFormat {
     Bgra8888,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PackedImageImportStrategy {
+    /// The producer allocation is directly sampled as a Vulkan image.
+    DirectSampledImage,
+    /// Linear packed pixels are imported as a uniform texel buffer and copied by compute into an
+    /// optimal BGRA image. This remains an ordinary renderer image at every paint-layer position.
+    LinearBufferToOptimalBgra,
+}
+
 impl PackedImageFormat {
     fn vk_format(self) -> vk::Format {
         match self {
@@ -74,14 +83,21 @@ const STAGED_NV12_SOURCE_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::UNI
 const STAGED_NV12_SOURCE_TEXEL_FORMAT: vk::Format = vk::Format::R32_UINT;
 const STAGED_NV12_LUMA_FORMAT: vk::Format = vk::Format::R8_UNORM;
 const STAGED_NV12_CHROMA_FORMAT: vk::Format = vk::Format::R8G8_UNORM;
+const STAGED_PACKED_SOURCE_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER;
+const STAGED_PACKED_SOURCE_TEXEL_FORMAT: vk::Format = vk::Format::R32_UINT;
+const STAGED_PACKED_STORAGE_VIEW_FORMAT: vk::Format = vk::Format::R32_UINT;
+const STAGED_PACKED_OUTPUT_USAGE: vk::ImageUsageFlags = STAGED_NV12_OUTPUT_USAGE;
 const DEFAULT_NV12_SOURCE_CACHE_ENTRIES: usize = 32;
 const DEFAULT_NV12_OUTPUT_SLOTS: usize = 8;
 const DEFAULT_PACKED_SOURCE_CACHE_ENTRIES: usize = 32;
+const DEFAULT_PACKED_OUTPUT_SLOTS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VulkanImportPoolLimits {
     pub nv12_source_cache_entries: usize,
     pub nv12_output_slots: usize,
+    pub packed_source_cache_entries: usize,
+    pub packed_output_slots: usize,
 }
 
 impl Default for VulkanImportPoolLimits {
@@ -89,6 +105,8 @@ impl Default for VulkanImportPoolLimits {
         Self {
             nv12_source_cache_entries: DEFAULT_NV12_SOURCE_CACHE_ENTRIES,
             nv12_output_slots: DEFAULT_NV12_OUTPUT_SLOTS,
+            packed_source_cache_entries: DEFAULT_PACKED_SOURCE_CACHE_ENTRIES,
+            packed_output_slots: DEFAULT_PACKED_OUTPUT_SLOTS,
         }
     }
 }
@@ -570,6 +588,7 @@ struct PackedSourceTopology {
     modifier: u64,
     plane: ImportedPlane,
     format: PackedImageFormat,
+    strategy: PackedImageImportStrategy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -580,8 +599,17 @@ struct PackedSourceCacheKey {
     topology: PackedSourceTopology,
 }
 
+enum PackedSourceAllocation<D: VulkanDeviceContext> {
+    Direct(ImageAllocation<D>),
+    Staged {
+        // The view must be destroyed before its buffer and imported memory.
+        view: BufferViewAllocation<D>,
+        source: BufferAllocation<D>,
+    },
+}
+
 struct CachedPackedSource<D: VulkanDeviceContext> {
-    allocation: ImageAllocation<D>,
+    allocation: PackedSourceAllocation<D>,
     format: PackedImageFormat,
     claimed: AtomicBool,
     last_used: AtomicU64,
@@ -608,11 +636,17 @@ struct PackedSourceLease<D: VulkanDeviceContext> {
 }
 
 impl<D: VulkanDeviceContext> PackedSourceLease<D> {
-    fn release(&self) {
-        if !self.released.swap(true, Ordering::AcqRel) {
-            let was_claimed = self.source.claimed.swap(false, Ordering::AcqRel);
-            debug_assert!(was_claimed, "packed source cache claim released twice");
+    fn release(&self) -> bool {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return false;
         }
+        let was_claimed = self.source.claimed.swap(false, Ordering::AcqRel);
+        debug_assert!(was_claimed, "packed source cache claim released twice");
+        true
+    }
+
+    fn is_released(&self) -> bool {
+        self.released.load(Ordering::Acquire)
     }
 }
 
@@ -668,12 +702,15 @@ impl<D: VulkanDeviceContext> PackedSourceCache<D> {
 pub struct PackedImportCacheStats {
     pub source_entries: usize,
     pub active_sources: usize,
+    pub output_slots: usize,
+    pub active_outputs: usize,
     pub source_cache_hits: u64,
     pub source_cache_misses: u64,
     pub source_cache_evictions: u64,
     pub source_active_reuse_rejections: u64,
     pub source_topology_collisions: u64,
     pub allocation_size_rejections: u64,
+    pub output_pool_busy_rejections: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -706,9 +743,12 @@ pub struct VulkanDmaBufImporter<D: VulkanDeviceContext> {
     // Pools must drop before the descriptor-set layouts owned by their pipelines.
     nv12_output_pool: Mutex<Nv12OutputPool<D>>,
     nv12_source_cache: Mutex<Nv12SourceCache<D>>,
+    packed_output_pool: Mutex<PackedOutputPool<D>>,
     packed_source_cache: Mutex<PackedSourceCache<D>>,
     nv12_rgba_compute: Option<Arc<Nv12ComputePipeline<D>>>,
     nv12_planar_compute: Option<Arc<Nv12ComputePipeline<D>>>,
+    packed_bgra_compute: Option<Arc<PackedComputePipeline<D>>>,
+    packed_bgra_staging_error: Option<String>,
     source_cache_hits: AtomicU64,
     source_cache_misses: AtomicU64,
     source_cache_evictions: AtomicU64,
@@ -722,6 +762,7 @@ pub struct VulkanDmaBufImporter<D: VulkanDeviceContext> {
     packed_source_active_reuse_rejections: AtomicU64,
     packed_source_topology_collisions: AtomicU64,
     packed_allocation_size_rejections: AtomicU64,
+    packed_output_pool_busy_rejections: AtomicU64,
     packed_source_cache_clock: AtomicU64,
 }
 
@@ -743,8 +784,12 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
         limits: VulkanImportPoolLimits,
         staging_preference: Nv12StagingPreference,
     ) -> Result<Self, String> {
-        if limits.nv12_source_cache_entries == 0 || limits.nv12_output_slots == 0 {
-            return Err("Vulkan NV12 import pool limits must be non-zero".to_string());
+        if limits.nv12_source_cache_entries == 0
+            || limits.nv12_output_slots == 0
+            || limits.packed_source_cache_entries == 0
+            || limits.packed_output_slots == 0
+        {
+            return Err("Vulkan import pool limits must be non-zero".to_string());
         }
         let nv12_capabilities = inventory_nv12_modifier_capabilities_with_staging_preference(
             device.as_ref(),
@@ -772,16 +817,30 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
         } else {
             None
         };
+        let (packed_bgra_compute, packed_bgra_staging_error) = match validate_packed_staging_support(
+            device.as_ref(),
+            PackedImageFormat::Bgra8888,
+            DRM_FORMAT_MOD_LINEAR,
+        ) {
+            Ok(()) => (
+                Some(Arc::new(PackedComputePipeline::new(Arc::clone(&device))?)),
+                None,
+            ),
+            Err(error) => (None, Some(error)),
+        };
         Ok(Self {
             device,
             nv12_capabilities,
             nv12_output_pool: Mutex::new(Nv12OutputPool::new(limits.nv12_output_slots)),
             nv12_source_cache: Mutex::new(Nv12SourceCache::new(limits.nv12_source_cache_entries)),
+            packed_output_pool: Mutex::new(PackedOutputPool::new(limits.packed_output_slots)),
             packed_source_cache: Mutex::new(PackedSourceCache::new(
-                DEFAULT_PACKED_SOURCE_CACHE_ENTRIES,
+                limits.packed_source_cache_entries,
             )),
             nv12_rgba_compute,
             nv12_planar_compute,
+            packed_bgra_compute,
+            packed_bgra_staging_error,
             source_cache_hits: AtomicU64::new(0),
             source_cache_misses: AtomicU64::new(0),
             source_cache_evictions: AtomicU64::new(0),
@@ -795,6 +854,7 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
             packed_source_active_reuse_rejections: AtomicU64::new(0),
             packed_source_topology_collisions: AtomicU64::new(0),
             packed_allocation_size_rejections: AtomicU64::new(0),
+            packed_output_pool_busy_rejections: AtomicU64::new(0),
             packed_source_cache_clock: AtomicU64::new(1),
         })
     }
@@ -807,13 +867,93 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
         &self.nv12_capabilities
     }
 
+    pub fn packed_import_strategy(
+        &self,
+        format: PackedImageFormat,
+        modifier: u64,
+    ) -> Result<PackedImageImportStrategy, String> {
+        match validate_packed_import_support(self.device.as_ref(), format, modifier) {
+            Ok(()) => Ok(PackedImageImportStrategy::DirectSampledImage),
+            Err(direct_error) => {
+                validate_packed_staging_support(self.device.as_ref(), format, modifier).map_err(
+                    |staged_error| {
+                        format!(
+                            "Vulkan packed import has neither direct nor staged support: direct={direct_error}; staged={staged_error}"
+                        )
+                    },
+                )?;
+                if self.packed_bgra_compute.is_none() {
+                    return Err(format!(
+                        "Vulkan packed staging pipeline is unavailable: {}",
+                        self.packed_bgra_staging_error
+                            .as_deref()
+                            .unwrap_or("pipeline initialization failed without a diagnostic")
+                    ));
+                }
+                Ok(PackedImageImportStrategy::LinearBufferToOptimalBgra)
+            }
+        }
+    }
+
+    /// Imports a packed image using the historical direct-sampled contract.
     pub fn import_packed(
         &self,
         request: PackedImageImport,
     ) -> Result<ImportedDmaBufImage<D>, String> {
-        self.claim_cached_packed_source(request).map(|source| {
-            ImportedDmaBufImage::from_packed_source(request.dimensions, request.modifier, source)
-        })
+        self.import_packed_with_strategy(request, PackedImageImportStrategy::DirectSampledImage)
+    }
+
+    pub fn import_packed_with_strategy(
+        &self,
+        request: PackedImageImport,
+        strategy: PackedImageImportStrategy,
+    ) -> Result<ImportedDmaBufImage<D>, String> {
+        let source = self.claim_cached_packed_source(request, strategy)?;
+        match strategy {
+            PackedImageImportStrategy::DirectSampledImage => {
+                ImportedDmaBufImage::from_direct_packed_source(
+                    request.dimensions,
+                    request.modifier,
+                    source,
+                )
+            }
+            PackedImageImportStrategy::LinearBufferToOptimalBgra => {
+                let source_view = match &source.source.allocation {
+                    PackedSourceAllocation::Staged { view, .. } => view.view,
+                    PackedSourceAllocation::Direct(_) => {
+                        return Err(
+                            "Vulkan staged packed import received a direct-image cache entry"
+                                .to_string(),
+                        );
+                    }
+                };
+                let pipeline = self.packed_bgra_compute.as_ref().cloned().ok_or_else(|| {
+                    "Vulkan packed BGRA staging pipeline is unavailable".to_string()
+                })?;
+                let output = {
+                    let mut pool = self
+                        .packed_output_pool
+                        .lock()
+                        .map_err(|_| "Vulkan packed output-pool lock poisoned".to_string())?;
+                    match pool.claim(
+                        Arc::clone(&self.device),
+                        request.dimensions,
+                        &pipeline,
+                        source_view,
+                    ) {
+                        Ok(output) => output,
+                        Err(error) => {
+                            if error.starts_with("Vulkan packed output pool is saturated") {
+                                self.packed_output_pool_busy_rejections
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            return Err(error);
+                        }
+                    }
+                };
+                create_staged_packed(request, source, output, pipeline)
+            }
+        }
     }
 
     pub fn evict_packed_stream(&self, stream_incarnation: u64) -> Result<(), String> {
@@ -838,12 +978,22 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
             .packed_source_cache
             .lock()
             .map_err(|_| "Vulkan packed source-cache lock poisoned".to_string())?;
+        let output_pool = self
+            .packed_output_pool
+            .lock()
+            .map_err(|_| "Vulkan packed output-pool lock poisoned".to_string())?;
         Ok(PackedImportCacheStats {
             source_entries: cache.entries.len(),
             active_sources: cache
                 .entries
                 .values()
                 .filter(|source| source.claimed.load(Ordering::Acquire))
+                .count(),
+            output_slots: output_pool.slots.len(),
+            active_outputs: output_pool
+                .slots
+                .iter()
+                .filter(|slot| slot.claimed.load(Ordering::Acquire))
                 .count(),
             source_cache_hits: self.packed_source_cache_hits.load(Ordering::Relaxed),
             source_cache_misses: self.packed_source_cache_misses.load(Ordering::Relaxed),
@@ -857,12 +1007,16 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
             allocation_size_rejections: self
                 .packed_allocation_size_rejections
                 .load(Ordering::Relaxed),
+            output_pool_busy_rejections: self
+                .packed_output_pool_busy_rejections
+                .load(Ordering::Relaxed),
         })
     }
 
     fn claim_cached_packed_source(
         &self,
         request: PackedImageImport,
+        strategy: PackedImageImportStrategy,
     ) -> Result<PackedSourceLease<D>, String> {
         let PackedImageImport {
             stream_incarnation,
@@ -881,7 +1035,20 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
             }
             return Err(error);
         }
-        validate_packed_import_support(self.device.as_ref(), format, modifier)?;
+        match strategy {
+            PackedImageImportStrategy::DirectSampledImage => {
+                validate_packed_import_support(self.device.as_ref(), format, modifier)?;
+            }
+            PackedImageImportStrategy::LinearBufferToOptimalBgra => {
+                validate_packed_staging_support(self.device.as_ref(), format, modifier)?;
+                if let Err(error) = validate_staged_packed_layout(self.device.as_ref(), source_size)
+                {
+                    self.packed_allocation_size_rejections
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(error);
+                }
+            }
+        }
         let (device, inode) = dmabuf_identity(source_fd)?;
         let topology = PackedSourceTopology {
             dimensions,
@@ -889,6 +1056,7 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
             modifier,
             plane,
             format,
+            strategy,
         };
         let key = PackedSourceCacheKey {
             stream_incarnation,
@@ -934,19 +1102,28 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
 
         self.packed_source_cache_misses
             .fetch_add(1, Ordering::Relaxed);
-        let allocation = match create_direct_image(
-            Arc::clone(&self.device),
-            dimensions,
-            source_fd,
-            modifier,
-            &[plane],
-            format.vk_format(),
-            DIRECT_PACKED_USAGE,
-            Some(source_size),
-        ) {
+        let allocation = match strategy {
+            PackedImageImportStrategy::DirectSampledImage => create_direct_image(
+                Arc::clone(&self.device),
+                dimensions,
+                source_fd,
+                modifier,
+                &[plane],
+                format.vk_format(),
+                DIRECT_PACKED_USAGE,
+                Some(source_size),
+            )
+            .map(PackedSourceAllocation::Direct),
+            PackedImageImportStrategy::LinearBufferToOptimalBgra => {
+                create_cached_packed_staged_source(Arc::clone(&self.device), source_fd, source_size)
+            }
+        };
+        let allocation = match allocation {
             Ok(allocation) => allocation,
             Err(error) => {
-                if error.starts_with("DMA-BUF object size ") {
+                if error.starts_with("DMA-BUF object size ")
+                    || error.starts_with("DMA-BUF allocation size ")
+                {
                     self.packed_allocation_size_rejections
                         .fetch_add(1, Ordering::Relaxed);
                 }
@@ -1284,6 +1461,7 @@ pub struct StagedNv12Planes {
 #[derive(Clone, Copy)]
 enum StagedSampledImages {
     Rgba { image: vk::Image },
+    Bgra { image: vk::Image },
     YuvPlanes { luma: vk::Image, chroma: vk::Image },
 }
 
@@ -1480,6 +1658,115 @@ impl<D: VulkanDeviceContext> Drop for Nv12OutputLease<D> {
     }
 }
 
+struct PackedOutputSlot<D: VulkanDeviceContext> {
+    device: Arc<D>,
+    dimensions: (u32, u32),
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_set: vk::DescriptorSet,
+    // The storage view must be destroyed before the image it aliases.
+    storage_view: ImageViewAllocation<D>,
+    sampled: ImageAllocation<D>,
+    claimed: AtomicBool,
+    initialized: AtomicBool,
+}
+
+impl<D: VulkanDeviceContext> Drop for PackedOutputSlot<D> {
+    fn drop(&mut self) {
+        unsafe {
+            self.device
+                .device()
+                .destroy_descriptor_pool(self.descriptor_pool, None);
+        }
+    }
+}
+
+struct PackedOutputPool<D: VulkanDeviceContext> {
+    slots: Vec<Arc<PackedOutputSlot<D>>>,
+    max_slots: usize,
+}
+
+impl<D: VulkanDeviceContext> PackedOutputPool<D> {
+    fn new(max_slots: usize) -> Self {
+        Self {
+            slots: Vec::new(),
+            max_slots,
+        }
+    }
+
+    fn claim(
+        &mut self,
+        device: Arc<D>,
+        dimensions: (u32, u32),
+        pipeline: &PackedComputePipeline<D>,
+        source_view: vk::BufferView,
+    ) -> Result<PackedOutputLease<D>, String> {
+        if let Some(slot) = self.slots.iter().find(|slot| {
+            slot.dimensions == dimensions
+                && slot
+                    .claimed
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+        }) {
+            update_packed_descriptor_set(device.as_ref(), slot, source_view);
+            return Ok(PackedOutputLease {
+                slot: Arc::clone(slot),
+                released: AtomicBool::new(false),
+            });
+        }
+        if self.slots.len() >= self.max_slots {
+            if let Some(idle) = self.slots.iter().position(|slot| {
+                !slot.claimed.load(Ordering::Acquire) && slot.dimensions != dimensions
+            }) {
+                self.slots.swap_remove(idle);
+            } else {
+                return Err(format!(
+                    "Vulkan packed output pool is saturated at {} slots",
+                    self.max_slots
+                ));
+            }
+        }
+        let slot = Arc::new(create_packed_output_slot(
+            device,
+            dimensions,
+            pipeline,
+            source_view,
+        )?);
+        slot.claimed.store(true, Ordering::Release);
+        self.slots.push(Arc::clone(&slot));
+        Ok(PackedOutputLease {
+            slot,
+            released: AtomicBool::new(false),
+        })
+    }
+}
+
+struct PackedOutputLease<D: VulkanDeviceContext> {
+    slot: Arc<PackedOutputSlot<D>>,
+    released: AtomicBool,
+}
+
+impl<D: VulkanDeviceContext> PackedOutputLease<D> {
+    fn release(&self) {
+        if !self.released.swap(true, Ordering::AcqRel) {
+            let was_claimed = self.slot.claimed.swap(false, Ordering::AcqRel);
+            debug_assert!(was_claimed, "packed output slot released twice");
+        }
+    }
+}
+
+impl<D: VulkanDeviceContext> Drop for PackedOutputLease<D> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+struct StagedPacked<D: VulkanDeviceContext> {
+    source: PackedSourceLease<D>,
+    output: PackedOutputLease<D>,
+    pipeline: Arc<PackedComputePipeline<D>>,
+    push_constants: PackedPushConstants,
+}
+
 struct StagedNv12<D: VulkanDeviceContext> {
     source: Nv12SourceLease<D>,
     output: Nv12OutputLease<D>,
@@ -1492,6 +1779,7 @@ enum ImportedKind<D: VulkanDeviceContext> {
     DirectPacked(PackedSourceLease<D>),
     DirectBgraScanout(ImageAllocation<D>),
     DirectNv12(ImageAllocation<D>, DirectNv12Sampling),
+    StagedPacked(StagedPacked<D>),
     StagedNv12(StagedNv12<D>),
 }
 
@@ -1539,18 +1827,23 @@ impl<D: VulkanDeviceContext> ImportedDmaBufImage<D> {
         })
     }
 
-    fn from_packed_source(
+    fn from_direct_packed_source(
         dimensions: (u32, u32),
         modifier: u64,
         source: PackedSourceLease<D>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, String> {
+        if !matches!(&source.source.allocation, PackedSourceAllocation::Direct(_)) {
+            return Err(
+                "Vulkan direct packed import received a staged-buffer cache entry".to_string(),
+            );
+        }
+        Ok(Self {
             kind: ImportedKind::DirectPacked(source),
             dimensions,
             modifier,
             sampled_usage: DIRECT_PACKED_USAGE,
             sampled_tiling: vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT,
-        }
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1599,23 +1892,38 @@ impl<D: VulkanDeviceContext> ImportedDmaBufImage<D> {
 
     pub fn image(&self) -> vk::Image {
         match &self.kind {
-            ImportedKind::DirectPacked(source) => source.source.allocation.image,
+            ImportedKind::DirectPacked(source) => match &source.source.allocation {
+                PackedSourceAllocation::Direct(allocation) => allocation.image,
+                PackedSourceAllocation::Staged { .. } => {
+                    unreachable!("direct packed import owns a direct image")
+                }
+            },
             ImportedKind::DirectBgraScanout(sampled) | ImportedKind::DirectNv12(sampled, _) => {
                 sampled.image
             }
+            ImportedKind::StagedPacked(staged) => staged.output.slot.sampled.image,
             ImportedKind::StagedNv12(staged) => match staged.output.slot.sampled_images() {
                 StagedSampledImages::Rgba { image } => image,
                 StagedSampledImages::YuvPlanes { luma, .. } => luma,
+                StagedSampledImages::Bgra { .. } => {
+                    unreachable!("NV12 output pool cannot contain a BGRA slot")
+                }
             },
         }
     }
 
     pub fn device(&self) -> &D {
         match &self.kind {
-            ImportedKind::DirectPacked(source) => source.source.allocation.device.as_ref(),
+            ImportedKind::DirectPacked(source) => match &source.source.allocation {
+                PackedSourceAllocation::Direct(allocation) => allocation.device.as_ref(),
+                PackedSourceAllocation::Staged { .. } => {
+                    unreachable!("direct packed import owns a direct image")
+                }
+            },
             ImportedKind::DirectBgraScanout(sampled) | ImportedKind::DirectNv12(sampled, _) => {
                 sampled.device.as_ref()
             }
+            ImportedKind::StagedPacked(staged) => staged.output.slot.device.as_ref(),
             ImportedKind::StagedNv12(staged) => staged.output.slot.device.as_ref(),
         }
     }
@@ -1644,6 +1952,7 @@ impl<D: VulkanDeviceContext> ImportedDmaBufImage<D> {
             },
             ImportedKind::DirectBgraScanout(_) => SampledImageFormat::Bgra8888,
             ImportedKind::DirectNv12(_, _) => SampledImageFormat::Nv12,
+            ImportedKind::StagedPacked(_) => SampledImageFormat::Bgra8888,
             ImportedKind::StagedNv12(staged) => match staged.output.slot.resources {
                 StagedOutputResources::Rgba { .. } => SampledImageFormat::Rgba8888,
                 StagedOutputResources::YuvPlanes { .. } => SampledImageFormat::Nv12Planes,
@@ -1666,18 +1975,22 @@ impl<D: VulkanDeviceContext> ImportedDmaBufImage<D> {
                     chroma_image: chroma,
                     conversion: staged.conversion,
                 }),
-                StagedSampledImages::Rgba { .. } => None,
+                StagedSampledImages::Rgba { .. } | StagedSampledImages::Bgra { .. } => None,
             },
             _ => None,
         }
     }
 
     pub fn is_staged(&self) -> bool {
-        matches!(self.kind, ImportedKind::StagedNv12(_))
+        matches!(
+            self.kind,
+            ImportedKind::StagedPacked(_) | ImportedKind::StagedNv12(_)
+        )
     }
 
     pub fn release_staged_source(&self) -> bool {
         match &self.kind {
+            ImportedKind::StagedPacked(staged) => staged.source.release(),
             ImportedKind::StagedNv12(staged) => staged.source.release(),
             _ => false,
         }
@@ -1685,37 +1998,75 @@ impl<D: VulkanDeviceContext> ImportedDmaBufImage<D> {
 
     pub fn staged_source_released(&self) -> bool {
         match &self.kind {
+            ImportedKind::StagedPacked(staged) => staged.source.is_released(),
             ImportedKind::StagedNv12(staged) => staged.source.is_released(),
             _ => false,
         }
     }
 
     pub(super) fn mark_acquire_submitted(&self) {
-        if let ImportedKind::StagedNv12(staged) = &self.kind {
-            staged
+        match &self.kind {
+            ImportedKind::StagedPacked(staged) => staged
                 .output
                 .slot
                 .initialized
-                .store(true, Ordering::Release);
+                .store(true, Ordering::Release),
+            ImportedKind::StagedNv12(staged) => staged
+                .output
+                .slot
+                .initialized
+                .store(true, Ordering::Release),
+            _ => {}
         }
     }
 
     pub(super) fn acquire_plan(&self) -> AcquirePlan {
         match &self.kind {
-            ImportedKind::StagedNv12(staged) => AcquirePlan::StagedNv12(StagedAcquirePlan {
+            ImportedKind::StagedPacked(staged) => {
+                let (source_buffer, source_size) = match &staged.source.source.allocation {
+                    PackedSourceAllocation::Staged { source, .. } => (source.buffer, source.size),
+                    PackedSourceAllocation::Direct(_) => {
+                        unreachable!("staged packed import owns a source buffer")
+                    }
+                };
+                AcquirePlan::StagedCompute(StagedAcquirePlan {
+                    source_buffer,
+                    source_size,
+                    output: StagedSampledImages::Bgra {
+                        image: staged.output.slot.sampled.image,
+                    },
+                    output_initialized: staged.output.slot.initialized.load(Ordering::Acquire),
+                    descriptor_set: staged.output.slot.descriptor_set,
+                    pipeline: staged.pipeline.pipeline,
+                    pipeline_layout: staged.pipeline.pipeline_layout,
+                    push_constants: StagedPushConstants::Packed(staged.push_constants),
+                    dispatch: (
+                        self.dimensions.0.div_ceil(16),
+                        self.dimensions.1.div_ceil(16),
+                    ),
+                })
+            }
+            ImportedKind::StagedNv12(staged) => AcquirePlan::StagedCompute(StagedAcquirePlan {
                 source_buffer: staged.source.source.source.buffer,
                 source_size: staged.source.source.source.size,
                 output: staged.output.slot.sampled_images(),
                 output_initialized: staged.output.slot.initialized.load(Ordering::Acquire),
-                strategy: staged.output.slot.strategy,
                 descriptor_set: staged.output.slot.descriptor_set,
                 pipeline: staged.pipeline.pipeline,
                 pipeline_layout: staged.pipeline.pipeline_layout,
-                push_constants: staged.push_constants,
-                dimensions: self.dimensions,
+                push_constants: StagedPushConstants::Nv12(staged.push_constants),
+                dispatch: (
+                    (self.dimensions.0 / 2).div_ceil(16),
+                    (self.dimensions.1 / 2).div_ceil(16),
+                ),
             }),
-            ImportedKind::DirectPacked(source) => AcquirePlan::DirectImage {
-                image: source.source.allocation.image,
+            ImportedKind::DirectPacked(source) => match &source.source.allocation {
+                PackedSourceAllocation::Direct(allocation) => AcquirePlan::DirectImage {
+                    image: allocation.image,
+                },
+                PackedSourceAllocation::Staged { .. } => {
+                    unreachable!("direct packed import owns a direct image")
+                }
             },
             ImportedKind::DirectBgraScanout(sampled) | ImportedKind::DirectNv12(sampled, _) => {
                 AcquirePlan::DirectImage {
@@ -1729,7 +2080,7 @@ impl<D: VulkanDeviceContext> ImportedDmaBufImage<D> {
 #[derive(Clone, Copy)]
 pub(super) enum AcquirePlan {
     DirectImage { image: vk::Image },
-    StagedNv12(StagedAcquirePlan),
+    StagedCompute(StagedAcquirePlan),
 }
 
 #[derive(Clone, Copy)]
@@ -1738,12 +2089,45 @@ pub(super) struct StagedAcquirePlan {
     pub source_size: u64,
     output: StagedSampledImages,
     pub output_initialized: bool,
-    pub strategy: Nv12ImportStrategy,
     pub descriptor_set: vk::DescriptorSet,
     pub pipeline: vk::Pipeline,
     pub pipeline_layout: vk::PipelineLayout,
-    pub push_constants: Nv12PushConstants,
-    pub dimensions: (u32, u32),
+    pub push_constants: StagedPushConstants,
+    pub dispatch: (u32, u32),
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum StagedPushConstants {
+    Nv12(Nv12PushConstants),
+    Packed(PackedPushConstants),
+}
+
+impl StagedPushConstants {
+    pub(super) fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Nv12(constants) => constants.as_bytes(),
+            Self::Packed(constants) => constants.as_bytes(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub(super) struct PackedPushConstants {
+    width: u32,
+    height: u32,
+    offset: u32,
+    pitch: u32,
+    source_format: u32,
+}
+
+impl PackedPushConstants {
+    pub(super) fn as_bytes(&self) -> &[u8] {
+        let pointer = std::ptr::from_ref(self).cast::<u8>();
+        // SAFETY: the push-constant struct is repr(C), contains only u32 values, and the returned
+        // slice cannot outlive the borrowed struct.
+        unsafe { std::slice::from_raw_parts(pointer, std::mem::size_of::<Self>()) }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1930,6 +2314,162 @@ impl<D: VulkanDeviceContext> Drop for Nv12ComputePipeline<D> {
     }
 }
 
+struct PackedComputePipeline<D: VulkanDeviceContext> {
+    device: Arc<D>,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+}
+
+impl<D: VulkanDeviceContext> PackedComputePipeline<D> {
+    fn new(device: Arc<D>) -> Result<Self, String> {
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_TEXEL_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        ];
+        let descriptor_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        let descriptor_set_layout = unsafe {
+            device
+                .device()
+                .create_descriptor_set_layout(&descriptor_info, None)
+        }
+        .map_err(|result| format!("failed to create packed descriptor layout: {result:?}"))?;
+        let result = (|| {
+            let set_layouts = [descriptor_set_layout];
+            let push_range = [vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .offset(0)
+                .size(
+                    u32::try_from(std::mem::size_of::<PackedPushConstants>())
+                        .map_err(|_| "packed push-constant size exceeds u32".to_string())?,
+                )];
+            let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&set_layouts)
+                .push_constant_ranges(&push_range);
+            let pipeline_layout = unsafe {
+                device
+                    .device()
+                    .create_pipeline_layout(&pipeline_layout_info, None)
+            }
+            .map_err(|result| format!("failed to create packed pipeline layout: {result:?}"))?;
+
+            let words = match packed_shader_words() {
+                Ok(words) => words,
+                Err(error) => {
+                    unsafe {
+                        device
+                            .device()
+                            .destroy_pipeline_layout(pipeline_layout, None)
+                    };
+                    return Err(error);
+                }
+            };
+            let shader_info = vk::ShaderModuleCreateInfo::default().code(&words);
+            let shader = match unsafe { device.device().create_shader_module(&shader_info, None) } {
+                Ok(shader) => shader,
+                Err(result) => {
+                    unsafe {
+                        device
+                            .device()
+                            .destroy_pipeline_layout(pipeline_layout, None)
+                    };
+                    return Err(format!(
+                        "failed to create packed compute shader: {result:?}"
+                    ));
+                }
+            };
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(shader)
+                .name(c"main");
+            let pipeline_info = [vk::ComputePipelineCreateInfo::default()
+                .stage(stage)
+                .layout(pipeline_layout)];
+            let pipeline_result = unsafe {
+                device.device().create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    &pipeline_info,
+                    None,
+                )
+            };
+            unsafe { device.device().destroy_shader_module(shader, None) };
+            let pipeline = match pipeline_result {
+                Ok(mut pipelines) => match pipelines.pop() {
+                    Some(pipeline) => pipeline,
+                    None => {
+                        unsafe {
+                            device
+                                .device()
+                                .destroy_pipeline_layout(pipeline_layout, None)
+                        };
+                        return Err("Vulkan returned no packed compute pipeline".to_string());
+                    }
+                },
+                Err((pipelines, result)) => {
+                    unsafe {
+                        pipelines
+                            .into_iter()
+                            .for_each(|pipeline| device.device().destroy_pipeline(pipeline, None));
+                        device
+                            .device()
+                            .destroy_pipeline_layout(pipeline_layout, None);
+                    }
+                    return Err(format!(
+                        "failed to create packed compute pipeline: {result:?}"
+                    ));
+                }
+            };
+            Ok(Self {
+                device: Arc::clone(&device),
+                descriptor_set_layout,
+                pipeline_layout,
+                pipeline,
+            })
+        })();
+        if result.is_err() {
+            unsafe {
+                device
+                    .device()
+                    .destroy_descriptor_set_layout(descriptor_set_layout, None)
+            };
+        }
+        result
+    }
+}
+
+impl<D: VulkanDeviceContext> Drop for PackedComputePipeline<D> {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.device().destroy_pipeline(self.pipeline, None);
+            self.device
+                .device()
+                .destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device
+                .device()
+                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+        }
+    }
+}
+
+fn packed_shader_words() -> Result<Vec<u32>, String> {
+    let bytes = include_bytes!("packed_to_bgra.comp.spv");
+    if !bytes.len().is_multiple_of(4) {
+        return Err("embedded packed compute shader has an invalid byte length".to_string());
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+        .collect())
+}
+
 fn shader_words(output: Nv12ComputeOutput) -> Result<Vec<u32>, String> {
     let bytes: &[u8] = match output {
         Nv12ComputeOutput::Rgba => include_bytes!("nv12.comp.spv"),
@@ -1963,6 +2503,37 @@ fn validate_staged_layout<D: VulkanDeviceContext>(
     if source_texel_count > u64::from(properties.limits.max_texel_buffer_elements) {
         return Err(format!(
             "Vulkan staged NV12 allocation requires {source_texel_count} R32 texels, exceeding maxTexelBufferElements {}",
+            properties.limits.max_texel_buffer_elements
+        ));
+    }
+    Ok(())
+}
+
+fn validate_staged_packed_layout<D: VulkanDeviceContext>(
+    device: &D,
+    source_size: u64,
+) -> Result<(), String> {
+    if !source_size.is_multiple_of(4) {
+        return Err(
+            "Vulkan staged packed allocation size must be four-byte aligned for shader access"
+                .to_string(),
+        );
+    }
+    if source_size > u64::from(u32::MAX) + 1 {
+        return Err(
+            "Vulkan staged packed allocation exceeds the shader's 32-bit byte-address range"
+                .to_string(),
+        );
+    }
+    let properties = unsafe {
+        device
+            .instance()
+            .get_physical_device_properties(device.physical_device())
+    };
+    let source_texel_count = source_size / 4;
+    if source_texel_count > u64::from(properties.limits.max_texel_buffer_elements) {
+        return Err(format!(
+            "Vulkan staged packed allocation requires {source_texel_count} R32 texels, exceeding maxTexelBufferElements {}",
             properties.limits.max_texel_buffer_elements
         ));
     }
@@ -2015,6 +2586,30 @@ fn create_cached_nv12_source<D: VulkanDeviceContext>(
     })
 }
 
+fn create_cached_packed_staged_source<D: VulkanDeviceContext>(
+    device: Arc<D>,
+    source_fd: i32,
+    source_size: u64,
+) -> Result<PackedSourceAllocation<D>, String> {
+    let source = create_imported_buffer(
+        Arc::clone(&device),
+        source_fd,
+        source_size,
+        STAGED_PACKED_SOURCE_USAGE,
+    )?;
+    let source_view_info = vk::BufferViewCreateInfo::default()
+        .buffer(source.buffer)
+        .format(STAGED_PACKED_SOURCE_TEXEL_FORMAT)
+        .offset(0)
+        .range(source_size);
+    let view = BufferViewAllocation {
+        device: Arc::clone(&device),
+        view: unsafe { device.device().create_buffer_view(&source_view_info, None) }
+            .map_err(|result| format!("failed to create staged packed source view: {result:?}"))?,
+    };
+    Ok(PackedSourceAllocation::Staged { view, source })
+}
+
 fn create_image_view<D: VulkanDeviceContext>(
     device: Arc<D>,
     image: vk::Image,
@@ -2033,7 +2628,7 @@ fn create_image_view<D: VulkanDeviceContext>(
                 .layer_count(1),
         );
     let view = unsafe { device.device().create_image_view(&info, None) }
-        .map_err(|result| format!("failed to create staged NV12 output view: {result:?}"))?;
+        .map_err(|result| format!("failed to create staged output view: {result:?}"))?;
     Ok(ImageViewAllocation { device, view })
 }
 
@@ -2200,6 +2795,137 @@ fn update_staged_descriptor_set<D: VulkanDeviceContext>(
         );
     }
     unsafe { device.device().update_descriptor_sets(&writes, &[]) };
+}
+
+fn create_packed_output_slot<D: VulkanDeviceContext>(
+    device: Arc<D>,
+    dimensions: (u32, u32),
+    pipeline: &PackedComputePipeline<D>,
+    source_view: vk::BufferView,
+) -> Result<PackedOutputSlot<D>, String> {
+    let sampled = create_local_image_with_flags(
+        Arc::clone(&device),
+        dimensions,
+        IMPORTED_SCANOUT_BGRA_FORMAT,
+        STAGED_PACKED_OUTPUT_USAGE,
+        vk::ImageCreateFlags::MUTABLE_FORMAT,
+        &[
+            IMPORTED_SCANOUT_BGRA_FORMAT,
+            STAGED_PACKED_STORAGE_VIEW_FORMAT,
+        ],
+    )?;
+    let storage_view = create_image_view(
+        Arc::clone(&device),
+        sampled.image,
+        STAGED_PACKED_STORAGE_VIEW_FORMAT,
+    )?;
+    let pool_sizes = [
+        vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::UNIFORM_TEXEL_BUFFER)
+            .descriptor_count(1),
+        vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_IMAGE)
+            .descriptor_count(1),
+    ];
+    let pool_info = vk::DescriptorPoolCreateInfo::default()
+        .max_sets(1)
+        .pool_sizes(&pool_sizes);
+    let descriptor_pool = unsafe { device.device().create_descriptor_pool(&pool_info, None) }
+        .map_err(|result| format!("failed to create staged packed descriptor pool: {result:?}"))?;
+    let set_layouts = [pipeline.descriptor_set_layout];
+    let set_info = vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(descriptor_pool)
+        .set_layouts(&set_layouts);
+    let descriptor_set = match unsafe { device.device().allocate_descriptor_sets(&set_info) } {
+        Ok(sets) => match sets.into_iter().next() {
+            Some(set) => set,
+            None => {
+                unsafe {
+                    device
+                        .device()
+                        .destroy_descriptor_pool(descriptor_pool, None)
+                };
+                return Err("Vulkan returned no staged packed descriptor set".to_string());
+            }
+        },
+        Err(result) => {
+            unsafe {
+                device
+                    .device()
+                    .destroy_descriptor_pool(descriptor_pool, None)
+            };
+            return Err(format!(
+                "failed to allocate staged packed descriptor set: {result:?}"
+            ));
+        }
+    };
+    let slot = PackedOutputSlot {
+        device: Arc::clone(&device),
+        dimensions,
+        descriptor_pool,
+        descriptor_set,
+        storage_view,
+        sampled,
+        claimed: AtomicBool::new(false),
+        initialized: AtomicBool::new(false),
+    };
+    update_packed_descriptor_set(device.as_ref(), &slot, source_view);
+    Ok(slot)
+}
+
+fn update_packed_descriptor_set<D: VulkanDeviceContext>(
+    device: &D,
+    slot: &PackedOutputSlot<D>,
+    source_view: vk::BufferView,
+) {
+    let source_views = [source_view];
+    let image_infos = [vk::DescriptorImageInfo::default()
+        .image_view(slot.storage_view.view)
+        .image_layout(vk::ImageLayout::GENERAL)];
+    let writes = [
+        vk::WriteDescriptorSet::default()
+            .dst_set(slot.descriptor_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_TEXEL_BUFFER)
+            .texel_buffer_view(&source_views),
+        vk::WriteDescriptorSet::default()
+            .dst_set(slot.descriptor_set)
+            .dst_binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+            .image_info(&image_infos),
+    ];
+    unsafe { device.device().update_descriptor_sets(&writes, &[]) };
+}
+
+fn create_staged_packed<D: VulkanDeviceContext>(
+    request: PackedImageImport,
+    source: PackedSourceLease<D>,
+    output: PackedOutputLease<D>,
+    pipeline: Arc<PackedComputePipeline<D>>,
+) -> Result<ImportedDmaBufImage<D>, String> {
+    let push_constants = PackedPushConstants {
+        width: request.dimensions.0,
+        height: request.dimensions.1,
+        offset: u32::try_from(request.plane.offset)
+            .map_err(|_| "Vulkan packed offset exceeds u32".to_string())?,
+        pitch: request.plane.pitch,
+        source_format: match request.format {
+            PackedImageFormat::Rgba8888 => 0,
+            PackedImageFormat::Bgra8888 => 1,
+        },
+    };
+    Ok(ImportedDmaBufImage {
+        kind: ImportedKind::StagedPacked(StagedPacked {
+            source,
+            output,
+            pipeline,
+            push_constants,
+        }),
+        dimensions: request.dimensions,
+        modifier: request.modifier,
+        sampled_usage: STAGED_PACKED_OUTPUT_USAGE,
+        sampled_tiling: vk::ImageTiling::OPTIMAL,
+    })
 }
 
 fn create_staged_nv12<D: VulkanDeviceContext>(
@@ -2499,7 +3225,27 @@ fn create_local_image<D: VulkanDeviceContext>(
     format: vk::Format,
     usage: vk::ImageUsageFlags,
 ) -> Result<ImageAllocation<D>, String> {
-    let info = vk::ImageCreateInfo::default()
+    create_local_image_with_flags(
+        device,
+        dimensions,
+        format,
+        usage,
+        vk::ImageCreateFlags::empty(),
+        &[],
+    )
+}
+
+fn create_local_image_with_flags<D: VulkanDeviceContext>(
+    device: Arc<D>,
+    dimensions: (u32, u32),
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+    flags: vk::ImageCreateFlags,
+    view_formats: &[vk::Format],
+) -> Result<ImageAllocation<D>, String> {
+    let mut format_list = vk::ImageFormatListCreateInfo::default().view_formats(view_formats);
+    let base_info = vk::ImageCreateInfo::default()
+        .flags(flags)
         .image_type(vk::ImageType::TYPE_2D)
         .format(format)
         .extent(vk::Extent3D {
@@ -2514,8 +3260,13 @@ fn create_local_image<D: VulkanDeviceContext>(
         .usage(usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED);
+    let info = if view_formats.is_empty() {
+        base_info
+    } else {
+        base_info.push_next(&mut format_list)
+    };
     let image = unsafe { device.device().create_image(&info, None) }
-        .map_err(|result| format!("failed to create staged NV12 output image: {result:?}"))?;
+        .map_err(|result| format!("failed to create staged output image: {result:?}"))?;
     let requirements = unsafe { device.device().get_image_memory_requirements(image) };
     let memory_type_index = match select_memory_type(device.as_ref(), requirements.memory_type_bits)
     {
@@ -2533,7 +3284,7 @@ fn create_local_image<D: VulkanDeviceContext>(
         Err(result) => {
             unsafe { device.device().destroy_image(image, None) };
             return Err(format!(
-                "failed to allocate staged NV12 output memory: {result:?}"
+                "failed to allocate staged output memory: {result:?}"
             ));
         }
     };
@@ -2542,9 +3293,7 @@ fn create_local_image<D: VulkanDeviceContext>(
             device.device().free_memory(memory, None);
             device.device().destroy_image(image, None);
         }
-        return Err(format!(
-            "failed to bind staged NV12 output memory: {result:?}"
-        ));
+        return Err(format!("failed to bind staged output memory: {result:?}"));
     }
     Ok(ImageAllocation {
         device,
@@ -2628,6 +3377,85 @@ pub fn validate_packed_import_support<D: VulkanDeviceContext>(
             | vk::FormatFeatureFlags::COLOR_ATTACHMENT,
         format.label(),
     )
+}
+
+pub fn validate_packed_staging_support<D: VulkanDeviceContext>(
+    device: &D,
+    format: PackedImageFormat,
+    modifier: u64,
+) -> Result<(), String> {
+    if modifier != DRM_FORMAT_MOD_LINEAR {
+        return Err(format!(
+            "Vulkan packed buffer staging requires linear modifier 0, got {modifier:#018x}"
+        ));
+    }
+    if !selected_queue_supports_compute(device) {
+        return Err("selected Vulkan queue does not support packed compute staging".to_string());
+    }
+    let external_info = vk::PhysicalDeviceExternalBufferInfo::default()
+        .flags(vk::BufferCreateFlags::empty())
+        .usage(STAGED_PACKED_SOURCE_USAGE)
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    let mut external = vk::ExternalBufferProperties::default();
+    unsafe {
+        device
+            .instance()
+            .get_physical_device_external_buffer_properties(
+                device.physical_device(),
+                &external_info,
+                &mut external,
+            )
+    };
+    let external = external.external_memory_properties;
+    validate_external_import(
+        external.external_memory_features,
+        external.compatible_handle_types,
+        &format!("linear {} source buffer", format.label()),
+    )?;
+
+    let mut source_properties = vk::FormatProperties2::default();
+    unsafe {
+        device.instance().get_physical_device_format_properties2(
+            device.physical_device(),
+            STAGED_PACKED_SOURCE_TEXEL_FORMAT,
+            &mut source_properties,
+        )
+    };
+    if !source_properties
+        .format_properties
+        .buffer_features
+        .contains(vk::FormatFeatureFlags::UNIFORM_TEXEL_BUFFER)
+    {
+        return Err("Vulkan R32_UINT packed source lacks uniform-texel-buffer support".to_string());
+    }
+
+    let output_required = vk::FormatFeatureFlags::SAMPLED_IMAGE
+        | vk::FormatFeatureFlags::STORAGE_IMAGE
+        | vk::FormatFeatureFlags::TRANSFER_SRC
+        | vk::FormatFeatureFlags::TRANSFER_DST;
+    let (_output_features, _max_extent) = query_optimal_staging_format_with_usage(
+        device,
+        IMPORTED_SCANOUT_BGRA_FORMAT,
+        output_required,
+        STAGED_PACKED_OUTPUT_USAGE,
+        vk::ImageCreateFlags::MUTABLE_FORMAT,
+    )?;
+    let mut storage_properties = vk::FormatProperties2::default();
+    unsafe {
+        device.instance().get_physical_device_format_properties2(
+            device.physical_device(),
+            STAGED_PACKED_STORAGE_VIEW_FORMAT,
+            &mut storage_properties,
+        )
+    };
+    if !storage_properties
+        .format_properties
+        .optimal_tiling_features
+        .contains(vk::FormatFeatureFlags::STORAGE_IMAGE)
+    {
+        return Err("Vulkan R32_UINT packed output view lacks storage-image support".to_string());
+    }
+    Ok(())
 }
 
 pub fn validate_rgba_import_support<D: VulkanDeviceContext>(
@@ -2862,6 +3690,22 @@ fn query_optimal_staging_format<D: VulkanDeviceContext>(
     format: vk::Format,
     required: vk::FormatFeatureFlags,
 ) -> Result<(vk::FormatFeatureFlags, vk::Extent3D), String> {
+    query_optimal_staging_format_with_usage(
+        device,
+        format,
+        required,
+        STAGED_NV12_OUTPUT_USAGE,
+        vk::ImageCreateFlags::empty(),
+    )
+}
+
+fn query_optimal_staging_format_with_usage<D: VulkanDeviceContext>(
+    device: &D,
+    format: vk::Format,
+    required: vk::FormatFeatureFlags,
+    usage: vk::ImageUsageFlags,
+    flags: vk::ImageCreateFlags,
+) -> Result<(vk::FormatFeatureFlags, vk::Extent3D), String> {
     let mut properties = vk::FormatProperties2::default();
     unsafe {
         device.instance().get_physical_device_format_properties2(
@@ -2883,7 +3727,8 @@ fn query_optimal_staging_format<D: VulkanDeviceContext>(
         .format(format)
         .ty(vk::ImageType::TYPE_2D)
         .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(STAGED_NV12_OUTPUT_USAGE);
+        .usage(usage)
+        .flags(flags);
     let mut image_properties = vk::ImageFormatProperties2::default();
     unsafe {
         device
@@ -3036,6 +3881,7 @@ mod tests {
                 pitch: 256,
             },
             format: PackedImageFormat::Bgra8888,
+            strategy: PackedImageImportStrategy::DirectSampledImage,
         };
         assert_ne!(
             base,
@@ -3048,6 +3894,13 @@ mod tests {
             base,
             PackedSourceTopology {
                 format: PackedImageFormat::Rgba8888,
+                ..base
+            }
+        );
+        assert_ne!(
+            base,
+            PackedSourceTopology {
+                strategy: PackedImageImportStrategy::LinearBufferToOptimalBgra,
                 ..base
             }
         );
@@ -3153,6 +4006,39 @@ mod tests {
     }
 
     #[test]
+    fn staged_packed_source_uses_bounded_texel_fetch_and_mutable_bgra_output() {
+        assert!(STAGED_PACKED_SOURCE_USAGE == vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER);
+        assert!(STAGED_PACKED_SOURCE_TEXEL_FORMAT == vk::Format::R32_UINT);
+        assert!(STAGED_PACKED_STORAGE_VIEW_FORMAT == vk::Format::R32_UINT);
+        assert!(STAGED_PACKED_OUTPUT_USAGE.contains(vk::ImageUsageFlags::SAMPLED));
+        assert!(STAGED_PACKED_OUTPUT_USAGE.contains(vk::ImageUsageFlags::STORAGE));
+        assert!(!STAGED_PACKED_SOURCE_USAGE.contains(vk::BufferUsageFlags::TRANSFER_SRC));
+
+        let bgra_word = |bytes: [u8; 4], format| match format {
+            PackedImageFormat::Rgba8888 => {
+                u32::from(bytes[2])
+                    | (u32::from(bytes[1]) << 8)
+                    | (u32::from(bytes[0]) << 16)
+                    | (u32::from(bytes[3]) << 24)
+            }
+            PackedImageFormat::Bgra8888 => {
+                u32::from(bytes[0])
+                    | (u32::from(bytes[1]) << 8)
+                    | (u32::from(bytes[2]) << 16)
+                    | (255 << 24)
+            }
+        };
+        assert_eq!(
+            bgra_word([0x11, 0x22, 0x33, 0x44], PackedImageFormat::Rgba8888),
+            0x4411_2233
+        );
+        assert_eq!(
+            bgra_word([0x33, 0x22, 0x11, 0x00], PackedImageFormat::Bgra8888),
+            0xff11_2233
+        );
+    }
+
+    #[test]
     fn staged_outputs_declare_ganesh_transfer_compatibility_without_exposing_the_source() {
         assert!(STAGED_NV12_OUTPUT_USAGE.contains(vk::ImageUsageFlags::SAMPLED));
         assert!(STAGED_NV12_OUTPUT_USAGE.contains(vk::ImageUsageFlags::STORAGE));
@@ -3163,13 +4049,17 @@ mod tests {
     }
 
     #[test]
-    fn embedded_nv12_compute_shaders_are_valid_spirv() {
+    fn embedded_compute_shaders_are_valid_spirv() {
         for output in [Nv12ComputeOutput::Rgba, Nv12ComputeOutput::YuvPlanes] {
             let words = shader_words(output).unwrap();
             assert_eq!(words.first().copied(), Some(0x0723_0203));
             assert!(words.len() > 16);
         }
+        let packed = packed_shader_words().unwrap();
+        assert_eq!(packed.first().copied(), Some(0x0723_0203));
+        assert!(packed.len() > 16);
         assert!(std::mem::size_of::<Nv12PushConstants>() <= 128);
+        assert!(std::mem::size_of::<PackedPushConstants>() <= 128);
     }
 
     #[test]
@@ -3177,6 +4067,8 @@ mod tests {
         let limits = VulkanImportPoolLimits::default();
         assert!(limits.nv12_source_cache_entries >= 10);
         assert!(limits.nv12_output_slots >= 4);
+        assert!(limits.packed_source_cache_entries >= 10);
+        assert!(limits.packed_output_slots >= 4);
     }
 
     #[test]

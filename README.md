@@ -237,9 +237,14 @@ runtime.
 The `vulkan` feature accepts a caller-selected `ash` device and owns generic
 DMA-BUF capability queries, memory import, `SYNC_FD` acquire, external queue
 ownership, and release-fence retirement. Directly sampleable images stay
-zero-copy. Linear NV12 can use an asynchronous GPU conversion to an
-optimal-tiled sampling image when the active driver cannot sample the producer
-layout directly. The adapter has no Skia, KMS, Wayland, EGL, or GL dependency.
+zero-copy. Linear NV12 can use asynchronous bounded staging to optimal Y/UV or
+RGBA images when the active driver cannot sample the producer layout directly.
+Linear packed RGBA/BGRA can likewise use a persistent `R32_UINT` texel-buffer
+source and compute-copy into an optimal BGRA image. The packed source never gains
+transfer usage, ignored XRGB alpha is forced opaque, source ownership returns as
+soon as the staging submission completes, and bounded output slots remain alive
+through renderer retirement. The adapter has no Skia, KMS, Wayland, EGL, or GL
+dependency.
 Metal and Direct3D adapters remain later work.
 
 ## Validation

@@ -19,3 +19,5 @@
   them opaquely through Rust prepare/claim, and replace the detached static
   worker with explicitly closed/joined lifecycle dispatchers whose destructors
   remain nonblocking.
+- Add persistent direct packed Vulkan imports plus explicit bounded linear-buffer-to-optimal-BGRA
+  compute staging for devices that cannot sample producer-linear images.
