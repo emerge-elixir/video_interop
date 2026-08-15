@@ -236,6 +236,22 @@ pub enum Nv12AllocationBindingRecipe {
     LinearBufferToRgba,
 }
 
+impl Nv12ImportStrategy {
+    pub fn allocation_recipe(self) -> Nv12AllocationBindingRecipe {
+        match self {
+            Self::DirectSampledImage => Nv12AllocationBindingRecipe::DirectSharedImage,
+            Self::LinearBufferToOptimalNv12 => {
+                Nv12AllocationBindingRecipe::LinearBufferToOptimalNv12
+            }
+            Self::LinearBufferToOptimalYuvPlanes => {
+                Nv12AllocationBindingRecipe::LinearBufferToOptimalYuvPlanes
+            }
+            Self::LinearBufferToYuvPlanes => Nv12AllocationBindingRecipe::LinearBufferToYuvPlanes,
+            Self::LinearBufferToRgba => Nv12AllocationBindingRecipe::LinearBufferToRgba,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum YcbcrModel {
     Bt601,
@@ -372,6 +388,24 @@ pub fn validate_nv12_shared_object_topology(
     Ok(layout)
 }
 
+fn nv12_plane_ends(
+    dimensions: (u32, u32),
+    layout: Nv12SharedObjectLayout,
+) -> Result<(u64, u64), String> {
+    let (width, height) = dimensions;
+    let plane_end = |plane: ImportedPlane, rows: u32| {
+        plane
+            .offset
+            .checked_add(u64::from(plane.pitch) * u64::from(rows.saturating_sub(1)))
+            .and_then(|end| end.checked_add(u64::from(width)))
+            .ok_or_else(|| "Vulkan NV12 plane extent overflow".to_string())
+    };
+    Ok((
+        plane_end(layout.planes[0], height)?,
+        plane_end(layout.planes[1], height / 2)?,
+    ))
+}
+
 fn validate_nv12_shared_layout(
     dimensions: (u32, u32),
     layout: Nv12SharedObjectLayout,
@@ -392,15 +426,7 @@ fn validate_nv12_shared_layout(
             "Vulkan NV12 chroma pitch must be divisible by two bytes per texel".to_string(),
         );
     }
-    let plane_end = |plane: ImportedPlane, rows: u32| {
-        plane
-            .offset
-            .checked_add(u64::from(plane.pitch) * u64::from(rows.saturating_sub(1)))
-            .and_then(|end| end.checked_add(u64::from(width)))
-            .ok_or_else(|| "Vulkan NV12 plane extent overflow".to_string())
-    };
-    let luma_end = plane_end(layout.planes[0], height)?;
-    let chroma_end = plane_end(layout.planes[1], height / 2)?;
+    let (luma_end, chroma_end) = nv12_plane_ends(dimensions, layout)?;
     if luma_end > layout.object_size || chroma_end > layout.object_size {
         return Err(format!(
             "Vulkan NV12 planes exceed DMA-BUF object size {} (luma_end={luma_end}, chroma_end={chroma_end})",
@@ -413,6 +439,15 @@ fn validate_nv12_shared_layout(
         return Err("Vulkan NV12 luma and chroma plane byte ranges overlap".to_string());
     }
     Ok(())
+}
+
+fn nv12_transfer_source_span(
+    dimensions: (u32, u32),
+    layout: Nv12SharedObjectLayout,
+) -> Result<u64, String> {
+    validate_transfer_layout(dimensions, layout)?;
+    let (luma_end, chroma_end) = nv12_plane_ends(dimensions, layout)?;
+    Ok(luma_end.max(chroma_end))
 }
 
 #[derive(Clone, Copy)]
@@ -431,23 +466,7 @@ pub struct Nv12ModifierCapability {
 
 impl Nv12ModifierCapability {
     pub fn allocation_recipe(self) -> Nv12AllocationBindingRecipe {
-        match self.strategy {
-            Nv12ImportStrategy::DirectSampledImage => {
-                Nv12AllocationBindingRecipe::DirectSharedImage
-            }
-            Nv12ImportStrategy::LinearBufferToOptimalNv12 => {
-                Nv12AllocationBindingRecipe::LinearBufferToOptimalNv12
-            }
-            Nv12ImportStrategy::LinearBufferToOptimalYuvPlanes => {
-                Nv12AllocationBindingRecipe::LinearBufferToOptimalYuvPlanes
-            }
-            Nv12ImportStrategy::LinearBufferToYuvPlanes => {
-                Nv12AllocationBindingRecipe::LinearBufferToYuvPlanes
-            }
-            Nv12ImportStrategy::LinearBufferToRgba => {
-                Nv12AllocationBindingRecipe::LinearBufferToRgba
-            }
-        }
+        self.strategy.allocation_recipe()
     }
 }
 
@@ -1429,6 +1448,7 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
         stream_incarnation: u64,
         source_fd: i32,
         topology: Nv12FrameTopology,
+        source_buffer_size: u64,
         strategy: Nv12ImportStrategy,
     ) -> Result<Nv12SourceLease<D>, String> {
         let (device_id, inode) = dmabuf_identity(source_fd)?;
@@ -1477,6 +1497,7 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
         let source = Arc::new(create_cached_nv12_source(
             Arc::clone(&self.device),
             source_fd,
+            source_buffer_size,
             topology.object_size,
             strategy,
         )?);
@@ -1552,7 +1573,22 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
             }
         }
         let topology = layout.frame_topology(dimensions);
-        let source = self.claim_cached_source(stream_incarnation, source_fd, topology, strategy)?;
+        let source_buffer_size = if matches!(
+            strategy,
+            Nv12ImportStrategy::LinearBufferToOptimalNv12
+                | Nv12ImportStrategy::LinearBufferToOptimalYuvPlanes
+        ) {
+            nv12_transfer_source_span(dimensions, layout)?
+        } else {
+            layout.object_size
+        };
+        let source = self.claim_cached_source(
+            stream_incarnation,
+            source_fd,
+            topology,
+            source_buffer_size,
+            strategy,
+        )?;
         let source_view = source.source.allocation.compute_view();
         let output = {
             let mut pool = self
@@ -2825,17 +2861,19 @@ fn dmabuf_identity(source_fd: i32) -> Result<(u64, u64), String> {
 fn create_cached_nv12_source<D: VulkanDeviceContext>(
     device: Arc<D>,
     source_fd: i32,
-    source_size: u64,
+    source_buffer_size: u64,
+    source_allocation_size: u64,
     strategy: Nv12ImportStrategy,
 ) -> Result<CachedNv12Source<D>, String> {
     let allocation = match strategy {
         Nv12ImportStrategy::LinearBufferToOptimalNv12
         | Nv12ImportStrategy::LinearBufferToOptimalYuvPlanes => {
             CachedNv12SourceAllocation::Transfer {
-                source: create_imported_buffer(
+                source: create_imported_buffer_with_allocation_size(
                     Arc::clone(&device),
                     source_fd,
-                    source_size,
+                    source_buffer_size,
+                    source_allocation_size,
                     TRANSFER_NV12_SOURCE_USAGE,
                 )?,
             }
@@ -2844,14 +2882,14 @@ fn create_cached_nv12_source<D: VulkanDeviceContext>(
             let source = create_imported_buffer(
                 Arc::clone(&device),
                 source_fd,
-                source_size,
+                source_allocation_size,
                 STAGED_NV12_SOURCE_USAGE,
             )?;
             let source_view_info = vk::BufferViewCreateInfo::default()
                 .buffer(source.buffer)
                 .format(STAGED_NV12_SOURCE_TEXEL_FORMAT)
                 .offset(0)
-                .range(source_size);
+                .range(source_allocation_size);
             let view = BufferViewAllocation {
                 device: Arc::clone(&device),
                 view: unsafe { device.device().create_buffer_view(&source_view_info, None) }
@@ -3526,23 +3564,38 @@ fn create_imported_buffer<D: VulkanDeviceContext>(
     source_size: u64,
     usage: vk::BufferUsageFlags,
 ) -> Result<BufferAllocation<D>, String> {
-    if source_fd < 0 || source_size == 0 {
+    create_imported_buffer_with_allocation_size(device, source_fd, source_size, source_size, usage)
+}
+
+fn create_imported_buffer_with_allocation_size<D: VulkanDeviceContext>(
+    device: Arc<D>,
+    source_fd: i32,
+    buffer_size: u64,
+    allocation_size: u64,
+    usage: vk::BufferUsageFlags,
+) -> Result<BufferAllocation<D>, String> {
+    if source_fd < 0 || buffer_size == 0 || allocation_size == 0 {
         return Err("Vulkan DMA-BUF buffer import requires a valid fd and size".to_string());
+    }
+    if buffer_size > allocation_size {
+        return Err(format!(
+            "Vulkan DMA-BUF source-buffer span {buffer_size} exceeds allocation size {allocation_size}"
+        ));
     }
     let mut external = vk::ExternalMemoryBufferCreateInfo::default()
         .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
     let info = vk::BufferCreateInfo::default()
-        .size(source_size)
+        .size(buffer_size)
         .usage(usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .push_next(&mut external);
     let buffer = unsafe { device.device().create_buffer(&info, None) }
         .map_err(|result| format!("failed to create Vulkan DMA-BUF source buffer: {result:?}"))?;
     let requirements = unsafe { device.device().get_buffer_memory_requirements(buffer) };
-    if requirements.size > source_size {
+    if requirements.size > allocation_size {
         unsafe { device.device().destroy_buffer(buffer, None) };
         return Err(format!(
-            "DMA-BUF allocation size {source_size} is smaller than Vulkan source-buffer requirement {}",
+            "DMA-BUF allocation size {allocation_size} is smaller than Vulkan source-buffer requirement {} for copy span {buffer_size}",
             requirements.size
         ));
     }
@@ -3567,7 +3620,7 @@ fn create_imported_buffer<D: VulkanDeviceContext>(
         .fd(raw_duplicate);
     let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
     let allocation = vk::MemoryAllocateInfo::default()
-        .allocation_size(source_size)
+        .allocation_size(allocation_size)
         .memory_type_index(memory_type_index)
         .push_next(&mut import)
         .push_next(&mut dedicated);
@@ -3594,7 +3647,7 @@ fn create_imported_buffer<D: VulkanDeviceContext>(
         device,
         buffer,
         memory,
-        size: source_size,
+        size: buffer_size,
     })
 }
 
@@ -4615,7 +4668,7 @@ mod tests {
     fn transfer_regions_preserve_exact_nv12_offsets_pitches_and_plane_extents() {
         let plan = StagedTransferPlan {
             source_buffer: vk::Buffer::null(),
-            source_size: 3_840,
+            source_size: 3_824,
             output: StagedSampledImages::Nv12 {
                 image: vk::Image::null(),
             },
@@ -4687,6 +4740,27 @@ mod tests {
             ],
         };
         assert!(validate_transfer_layout((64, 32), valid).is_ok());
+        assert_eq!(nv12_transfer_source_span((64, 32), valid).unwrap(), 3_824);
+
+        let camera = Nv12SharedObjectLayout {
+            modifier: DRM_FORMAT_MOD_LINEAR,
+            object_size: 5_529_856,
+            planes: [
+                ImportedPlane {
+                    offset: 0,
+                    pitch: 2_560,
+                },
+                ImportedPlane {
+                    offset: 3_686_400,
+                    pitch: 2_560,
+                },
+            ],
+        };
+        assert_eq!(
+            nv12_transfer_source_span((2_560, 1_440), camera).unwrap(),
+            5_529_600
+        );
+        assert_eq!(camera.object_size - 5_529_600, 256);
         assert!(
             validate_transfer_layout(
                 (64, 32),

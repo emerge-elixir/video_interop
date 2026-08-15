@@ -24,5 +24,8 @@
 - Add bounded linear-buffer-to-optimal NV12 transfer staging with exact plane copy regions,
   multi-planar sampler-YCbCr output where exact filtering exists, separate optimal Y/UV transfer
   output otherwise, explicit external ownership return, and compute-planar rollback.
+- Separate the NV12 transfer buffer's exact copied-byte span from the complete imported allocation
+  size so truthful producer-owned V3DV read-ahead tails satisfy Vulkan memory requirements without
+  entering any copy region.
 - Isolate host-built Rust schema test NIFs under the ignored Cargo target directory so they
   cannot leak into a Nerves target release through the application's `priv` directory.

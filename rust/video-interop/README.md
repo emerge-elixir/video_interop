@@ -54,9 +54,11 @@ NV12 source imports are persistently cached by stream incarnation, DMA-BUF
 `(st_dev, st_ino)`, complete allocation size, modifier, exact plane topology, and
 selected read strategy. Active reappearance and topology/strategy collisions fail
 closed, eviction is idle-only, and renderer-native outputs use a bounded persistent
-pool. Transfer staging requires four-byte-aligned plane offsets, uses exact
-`VkBufferImageCopy` row lengths and plane extents, and never copies padding beyond
-the published allocation. A dedicated source fence proves staging plus return to
+pool. Transfer staging requires four-byte-aligned plane offsets, sizes the logical
+Vulkan source buffer to the last copied plane byte, and imports the complete, potentially
+larger producer allocation. This allows a truthful producer-owned driver read-ahead tail
+without copying it. Exact `VkBufferImageCopy` row lengths and plane extents never copy
+padding. A dedicated source fence proves staging plus return to
 `QUEUE_FAMILY_EXTERNAL`, allowing the producer lease to retire before
 composition/presentation. Reusable synchronization
 lanes retain command pools, command buffers, fences, temporary-import semaphores,

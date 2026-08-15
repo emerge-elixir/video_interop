@@ -240,7 +240,9 @@ ownership, and release-fence retirement. Directly sampleable images stay
 zero-copy. Linear NV12 can use asynchronous bounded plane-for-plane transfer into
 one optimal multi-planar NV12 image for hardware sampler YCbCr conversion, or into
 separate optimal Y/UV images when exact hardware chroma filtering is unavailable.
-The established optimal Y/UV or RGBA compute paths remain capability and
+The logical Vulkan transfer buffer ends at the final copied plane byte, independently
+of a truthfully published larger producer allocation, so driver read-ahead tails remain
+mapped but outside every copy region. The established optimal Y/UV or RGBA compute paths remain capability and
 qualification fallbacks. Linear packed RGBA/BGRA can likewise use a persistent
 `R32_UINT` texel-buffer
 source and compute-copy into an optimal BGRA image. The packed source never gains
