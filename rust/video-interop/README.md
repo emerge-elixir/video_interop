@@ -30,12 +30,14 @@ The optional `vulkan` feature provides a renderer-neutral DMA-BUF importer over
 an application-selected `ash` device. It owns modifier and external-memory
 queries, CLOEXEC FD import, temporary `SYNC_FD` waits, core external queue-family
 transfers, and release-fence retirement. Directly sampleable formats remain
-zero-copy. Linear NV12 on devices such as V3DV is imported as an `R32_UINT`
-uniform texel buffer, avoiding V3DV's SSBO and TFU read-ahead requirements. When
-optimal `R8_UNORM`/`R8G8_UNORM` storage and filtered sampling are available, a
-2×2 compute dispatch stages exact Y/UV bytes into persistent planar images and
-defers range/matrix/siting conversion to the renderer; otherwise a 2×2 RGBA
-compute fallback remains available.
+zero-copy. For linear NV12 on devices such as V3DV, the preferred `auto` path
+imports the exact allocation as a transfer-source buffer and copies two explicit
+pitch/offset-bounded regions. It first uses one persistent optimal multi-planar NV12
+image with Vulkan sampler YCbCr conversion. If the driver cannot provide exact
+linear chroma reconstruction, the same transfer fills separate persistent optimal
+`R8_UNORM`/`R8G8_UNORM` images for the renderer's exact YUV shader. The established
+`R32_UINT` uniform-texel-buffer compute path remains the planar rollback, followed
+by a 2×2 RGBA compute fallback.
 
 Packed RGBA/BGRA imports are also persistent. Callers select the exact Vulkan
 byte order, publish the complete DMA-BUF allocation size, and provide one-plane
@@ -49,11 +51,14 @@ strategies cache by stream incarnation plus DMA-BUF identity and complete
 topology, reject active reuse/collisions, and evict only idle entries.
 
 NV12 source imports are persistently cached by stream incarnation, DMA-BUF
-`(st_dev, st_ino)`, complete allocation size, modifier, and exact plane topology.
-Active reappearance and topology collisions fail closed, eviction is idle-only,
-and renderer-native outputs use a bounded persistent pool. A dedicated source
-fence proves conversion plus return to `QUEUE_FAMILY_EXTERNAL`, allowing the
-producer lease to retire before composition/presentation. Reusable synchronization
+`(st_dev, st_ino)`, complete allocation size, modifier, exact plane topology, and
+selected read strategy. Active reappearance and topology/strategy collisions fail
+closed, eviction is idle-only, and renderer-native outputs use a bounded persistent
+pool. Transfer staging requires four-byte-aligned plane offsets, uses exact
+`VkBufferImageCopy` row lengths and plane extents, and never copies padding beyond
+the published allocation. A dedicated source fence proves staging plus return to
+`QUEUE_FAMILY_EXTERNAL`, allowing the producer lease to retire before
+composition/presentation. Reusable synchronization
 lanes retain command pools, command buffers, fences, temporary-import semaphores,
 and nonblocking timestamp queries; renderer-owned ready semaphores are never
 pooled after handoff. The path never maps the producer allocation, waits on the

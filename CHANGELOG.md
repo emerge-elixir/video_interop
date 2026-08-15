@@ -21,5 +21,8 @@
   remain nonblocking.
 - Add persistent direct packed Vulkan imports plus explicit bounded linear-buffer-to-optimal-BGRA
   compute staging for devices that cannot sample producer-linear images.
+- Add bounded linear-buffer-to-optimal NV12 transfer staging with exact plane copy regions,
+  multi-planar sampler-YCbCr output where exact filtering exists, separate optimal Y/UV transfer
+  output otherwise, explicit external ownership return, and compute-planar rollback.
 - Isolate host-built Rust schema test NIFs under the ignored Cargo target directory so they
   cannot leak into a Nerves target release through the application's `priv` directory.

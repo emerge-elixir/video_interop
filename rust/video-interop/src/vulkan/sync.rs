@@ -9,8 +9,8 @@ use std::{
 use ash::vk;
 
 use super::{
-    AcquirePlan, ImportedDmaBufImage, StagedAcquirePlan, StagedSampledImages, VulkanDeviceContext,
-    duplicate_import_fd,
+    AcquirePlan, ImportedDmaBufImage, StagedAcquirePlan, StagedSampledImages, StagedTransferPlan,
+    VulkanDeviceContext, duplicate_import_fd,
 };
 
 /// DMA-BUF ownership outside this logical Vulkan device. The core external family is used rather
@@ -299,6 +299,12 @@ impl<D: VulkanDeviceContext> ImportedImageSync<D> {
                 record_direct_acquire(self.device.as_ref(), self.acquire_command, image)
             }
             AcquirePlan::StagedCompute(plan) => record_staged_acquire(
+                self.device.as_ref(),
+                self.acquire_command,
+                plan,
+                self.timestamp_query.as_ref(),
+            ),
+            AcquirePlan::StagedTransfer(plan) => record_staged_transfer_acquire(
                 self.device.as_ref(),
                 self.acquire_command,
                 plan,
@@ -660,7 +666,9 @@ fn record_direct_acquire<D: VulkanDeviceContext>(
 
 fn staged_output_images(output: StagedSampledImages) -> Vec<vk::Image> {
     match output {
-        StagedSampledImages::Rgba { image } | StagedSampledImages::Bgra { image } => vec![image],
+        StagedSampledImages::Rgba { image }
+        | StagedSampledImages::Bgra { image }
+        | StagedSampledImages::Nv12 { image } => vec![image],
         StagedSampledImages::YuvPlanes { luma, chroma } => vec![luma, chroma],
     }
 }
@@ -802,6 +810,230 @@ fn record_staged_acquire<D: VulkanDeviceContext>(
             );
         }
     };
+    end_command(device, command)
+}
+
+fn nv12_transfer_region(
+    aspect_mask: vk::ImageAspectFlags,
+    buffer_offset: u64,
+    buffer_row_length: u32,
+    width: u32,
+    height: u32,
+) -> vk::BufferImageCopy {
+    vk::BufferImageCopy::default()
+        .buffer_offset(buffer_offset)
+        .buffer_row_length(buffer_row_length)
+        .buffer_image_height(0)
+        .image_subresource(
+            vk::ImageSubresourceLayers::default()
+                .aspect_mask(aspect_mask)
+                .mip_level(0)
+                .base_array_layer(0)
+                .layer_count(1),
+        )
+        .image_offset(vk::Offset3D::default())
+        .image_extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        })
+}
+
+pub(super) fn nv12_multiplanar_transfer_regions(
+    plan: StagedTransferPlan,
+) -> [vk::BufferImageCopy; 2] {
+    [
+        nv12_transfer_region(
+            vk::ImageAspectFlags::PLANE_0,
+            plan.planes[0].offset,
+            plan.planes[0].pitch,
+            plan.dimensions.0,
+            plan.dimensions.1,
+        ),
+        nv12_transfer_region(
+            vk::ImageAspectFlags::PLANE_1,
+            plan.planes[1].offset,
+            plan.planes[1].pitch / 2,
+            plan.dimensions.0 / 2,
+            plan.dimensions.1 / 2,
+        ),
+    ]
+}
+
+pub(super) fn nv12_separate_transfer_regions(plan: StagedTransferPlan) -> [vk::BufferImageCopy; 2] {
+    [
+        nv12_transfer_region(
+            vk::ImageAspectFlags::COLOR,
+            plan.planes[0].offset,
+            plan.planes[0].pitch,
+            plan.dimensions.0,
+            plan.dimensions.1,
+        ),
+        nv12_transfer_region(
+            vk::ImageAspectFlags::COLOR,
+            plan.planes[1].offset,
+            plan.planes[1].pitch / 2,
+            plan.dimensions.0 / 2,
+            plan.dimensions.1 / 2,
+        ),
+    ]
+}
+
+fn record_staged_transfer_acquire<D: VulkanDeviceContext>(
+    device: &D,
+    command: vk::CommandBuffer,
+    plan: StagedTransferPlan,
+    timestamp_query: Option<&TimestampQuery>,
+) -> Result<(), String> {
+    let output_images = match plan.output {
+        StagedSampledImages::Nv12 { image } => vec![image],
+        StagedSampledImages::YuvPlanes { luma, chroma } => vec![luma, chroma],
+        StagedSampledImages::Rgba { .. } | StagedSampledImages::Bgra { .. } => {
+            return Err("Vulkan NV12 transfer has a non-planar output".to_string());
+        }
+    };
+    begin_command(device, command)?;
+    if let Some(query) = timestamp_query {
+        unsafe {
+            device
+                .device()
+                .cmd_reset_query_pool(command, query.pool, 0, 3);
+            device.device().cmd_write_timestamp(
+                command,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                query.pool,
+                0,
+            );
+        }
+    }
+    let source_acquire = vk::BufferMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+        .src_queue_family_index(DMA_BUF_EXTERNAL_QUEUE_FAMILY)
+        .dst_queue_family_index(device.queue_family_index())
+        .buffer(plan.source_buffer)
+        .offset(0)
+        .size(plan.source_size);
+    let old_layout = if plan.output_initialized {
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+    } else {
+        vk::ImageLayout::UNDEFINED
+    };
+    let old_access = if plan.output_initialized {
+        vk::AccessFlags::SHADER_READ
+    } else {
+        vk::AccessFlags::empty()
+    };
+    let output_acquires = output_images
+        .iter()
+        .copied()
+        .map(|image| {
+            color_range(image)
+                .src_access_mask(old_access)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .old_layout(old_layout)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        })
+        .collect::<Vec<_>>();
+    let source_stage = if plan.output_initialized {
+        vk::PipelineStageFlags::FRAGMENT_SHADER
+    } else {
+        vk::PipelineStageFlags::TOP_OF_PIPE
+    };
+    unsafe {
+        device.device().cmd_pipeline_barrier(
+            command,
+            source_stage,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[source_acquire],
+            &output_acquires,
+        );
+        match plan.output {
+            StagedSampledImages::Nv12 { image } => {
+                device.device().cmd_copy_buffer_to_image(
+                    command,
+                    plan.source_buffer,
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &nv12_multiplanar_transfer_regions(plan),
+                );
+            }
+            StagedSampledImages::YuvPlanes { luma, chroma } => {
+                let regions = nv12_separate_transfer_regions(plan);
+                device.device().cmd_copy_buffer_to_image(
+                    command,
+                    plan.source_buffer,
+                    luma,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &regions[0..1],
+                );
+                device.device().cmd_copy_buffer_to_image(
+                    command,
+                    plan.source_buffer,
+                    chroma,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &regions[1..2],
+                );
+            }
+            StagedSampledImages::Rgba { .. } | StagedSampledImages::Bgra { .. } => {
+                unreachable!("validated transfer output")
+            }
+        }
+    }
+    let output_releases = output_images
+        .into_iter()
+        .map(|image| {
+            color_range(image)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        })
+        .collect::<Vec<_>>();
+    unsafe {
+        device.device().cmd_pipeline_barrier(
+            command,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &output_releases,
+        );
+    }
+    let source_release = vk::BufferMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+        .dst_access_mask(vk::AccessFlags::empty())
+        .src_queue_family_index(device.queue_family_index())
+        .dst_queue_family_index(DMA_BUF_EXTERNAL_QUEUE_FAMILY)
+        .buffer(plan.source_buffer)
+        .offset(0)
+        .size(plan.source_size);
+    unsafe {
+        device.device().cmd_pipeline_barrier(
+            command,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[source_release],
+            &[],
+        );
+        if let Some(query) = timestamp_query {
+            device.device().cmd_write_timestamp(
+                command,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                query.pool,
+                1,
+            );
+        }
+    }
     end_command(device, command)
 }
 
