@@ -1,4 +1,4 @@
-use std::os::fd::OwnedFd;
+use std::{collections::BTreeSet, os::fd::OwnedFd};
 
 use crate::{DuplicateError, Modifier, ValidationError, duplicate_fd_cloexec};
 
@@ -145,6 +145,16 @@ impl Descriptor {
             });
         }
 
+        let referenced = self
+            .layers
+            .iter()
+            .flat_map(|layer| layer.planes.iter())
+            .map(|plane| plane.object_index as usize)
+            .collect::<BTreeSet<_>>();
+        if let Some(index) = (0..self.objects.len()).find(|index| !referenced.contains(index)) {
+            return Err(ValidationError::UnreferencedObject { index });
+        }
+
         Ok(())
     }
 
@@ -282,11 +292,18 @@ mod tests {
             ],
             layers: vec![Layer {
                 fourcc: u32::from_le_bytes(*b"XR24"),
-                planes: vec![Plane {
-                    object_index: 0,
-                    offset: 0,
-                    pitch: 256,
-                }],
+                planes: vec![
+                    Plane {
+                        object_index: 0,
+                        offset: 0,
+                        pitch: 256,
+                    },
+                    Plane {
+                        object_index: 1,
+                        offset: 0,
+                        pitch: 256,
+                    },
+                ],
             }],
         };
 

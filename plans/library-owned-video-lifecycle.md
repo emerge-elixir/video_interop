@@ -207,10 +207,11 @@ Change `VideoInterop.LeaseOwner.issue/3` to:
 
 Rules:
 
-1. Monitor and preflight the local owner before sending.
-2. If no request was sent, return `{:error, {:caller_owned, reason}}`.
-3. The send operation is the ownership boundary.
-4. Every timeout, rejection, release failure, or owner death after send returns
+1. Monitor and preflight the local owner, then reserve capacity without sending the token.
+2. Capacity, draining, timeout, or owner death before commit returns
+   `{:error, {:caller_owned, reason}}`.
+3. The token-bearing commit send is the ownership boundary.
+4. Every timeout, release failure, or owner death after commit returns
    `{:error, {:transferred, reason}}`.
 5. Remove aliases and monitor messages on every return path.
 6. Backend tokens require an independent owner-crash/message-drop destructor

@@ -31,6 +31,14 @@ defmodule VideoInterop.DescriptorTest do
     assert :ok = VideoInterop.validate(descriptor)
   end
 
+  test "rejects descriptor objects that no plane references" do
+    descriptor = nv12_descriptor(0)
+    extra = %Object{fd: 11, size: 4_096, modifier: 0}
+
+    assert {:error, {:unreferenced_object, 1}} =
+             VideoInterop.validate(%{descriptor | objects: descriptor.objects ++ [extra]})
+  end
+
   test "supports layouts without a fixed format registry" do
     i420 =
       descriptor(

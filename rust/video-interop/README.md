@@ -29,8 +29,10 @@ mandatory EGL/GL link dependency.
 The optional `vulkan` feature provides a renderer-neutral DMA-BUF importer over
 an application-selected `ash` device. It owns modifier and external-memory
 queries, CLOEXEC FD import, temporary `SYNC_FD` waits, core external queue-family
-transfers, and release-fence retirement. Directly sampleable formats remain
-zero-copy. For linear NV12 on devices such as V3DV, the preferred `auto` path
+transfers, and release-fence retirement. Every published allocation size is
+checked against the fd-backed DMA-BUF size before import, and queue submission
+runs through the renderer's external-synchronization authority. Directly
+sampleable formats remain zero-copy. For linear NV12 on devices such as V3DV, the preferred `auto` path
 imports the exact allocation as a transfer-source buffer and copies two explicit
 pitch/offset-bounded regions. It first uses one persistent optimal multi-planar NV12
 image with Vulkan sampler YCbCr conversion. If the driver cannot provide exact
@@ -50,9 +52,9 @@ transfer usage on the producer, and XRGB's ignored byte is forced opaque. Both
 strategies cache by stream incarnation plus DMA-BUF identity and complete
 topology, reject active reuse/collisions, and evict only idle entries.
 
-NV12 source imports are persistently cached by stream incarnation, DMA-BUF
-`(st_dev, st_ino)`, complete allocation size, modifier, exact plane topology, and
-selected read strategy. Active reappearance and topology/strategy collisions fail
+NV12 source imports, including direct sampled images, are persistently cached by
+stream incarnation, DMA-BUF `(st_dev, st_ino)`, complete allocation size,
+modifier, exact plane topology, and selected read strategy. Active reappearance and topology/strategy collisions fail
 closed, eviction is idle-only, and renderer-native outputs use a bounded persistent
 pool. Transfer staging requires four-byte-aligned plane offsets, sizes the logical
 Vulkan source buffer to the last copied plane byte, and imports the complete, potentially
@@ -62,8 +64,9 @@ padding. A dedicated source fence proves staging plus return to
 `QUEUE_FAMILY_EXTERNAL`, allowing the producer lease to retire before
 composition/presentation. Reusable synchronization
 lanes retain command pools, command buffers, fences, temporary-import semaphores,
-and nonblocking timestamp queries; renderer-owned ready semaphores are never
-pooled after handoff. The path never maps the producer allocation, waits on the
+and nonblocking timestamp queries. Each lane binds one unique import identity,
+checks renderer wait/release transitions, and quarantines uncertain in-flight
+drop; renderer-owned ready semaphores are never pooled after handoff. The path never maps the producer allocation, waits on the
 CPU during ordinary frames, or introduces EGL/GL dependencies. Skia,
 window-system, KMS, color conversion, and device-selection integration remain
 the renderer's responsibility.

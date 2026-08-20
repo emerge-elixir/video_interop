@@ -59,6 +59,24 @@ defmodule VideoInterop.RustSchemaTest do
     assert is_reference(resource)
   end
 
+  test "dead release recipients are counted without failing the dispatcher" do
+    assert {:ok, {fd, resource}} = SchemaNative.open_test_fd()
+    assert {:ok, {dispatcher, probe}} = SchemaNative.start_dispatcher()
+    owner = spawn(fn -> :ok end)
+    monitor = Process.monitor(owner)
+    assert_receive {:DOWN, ^monitor, :process, ^owner, _reason}
+
+    lease = Lease.new(owner, make_ref())
+
+    assert SchemaNative.claim_and_drop_frame(frame(fd, :implicit, lease), dispatcher) ==
+             {:ok, true}
+
+    eventually(fn -> SchemaNative.dispatcher_undelivered_commands(probe) == 1 end)
+    assert SchemaNative.dispatcher_health(probe) == "healthy"
+    assert SchemaNative.shutdown_dispatcher(dispatcher) == {:ok, true}
+    assert is_reference(resource)
+  end
+
   test "explicit native retirement releases exactly once" do
     assert {:ok, {fd, resource}} = SchemaNative.open_test_fd()
     assert {:ok, {dispatcher, _probe}} = SchemaNative.start_dispatcher()
@@ -204,6 +222,18 @@ defmodule VideoInterop.RustSchemaTest do
       acquire_sync: acquire_sync,
       lease: lease
     }
+  end
+
+  defp eventually(assertion, attempts \\ 100)
+  defp eventually(assertion, 0), do: assert(assertion.())
+
+  defp eventually(assertion, attempts) do
+    if assertion.() do
+      :ok
+    else
+      Process.sleep(1)
+      eventually(assertion, attempts - 1)
+    end
   end
 
   defp descriptor(fd) do

@@ -69,15 +69,36 @@ defmodule VideoInterop.Lease do
   cancellation before that confirmation must remove the pending holder. The child lease replaces
   both the holder and guard; it never copies the parent's guard.
   """
-  @spec retain(t(), timeout()) :: {:ok, t()} | {:error, :timeout | term()}
-  def retain(%__MODULE__{} = lease, timeout \\ 5_000) do
-    request_ref = Process.alias()
-    child_holder = make_ref()
+  @spec retain(t(), timeout()) ::
+          {:ok, t()} | {:error, :timeout | {:owner_down, term()} | term()}
+  def retain(%__MODULE__{owner: owner} = lease, timeout \\ 5_000) do
+    cond do
+      node(owner) != node() ->
+        {:error, {:owner_down, :owner_must_be_a_local_pid}}
 
-    send(
-      lease.owner,
-      {@retain_tag, lease.token, lease.holder, child_holder, self(), request_ref}
-    )
+      true ->
+        monitor_ref = Process.monitor(owner)
+
+        if Process.alive?(owner) do
+          request_ref = Process.alias()
+          child_holder = make_ref()
+
+          send(
+            owner,
+            {@retain_tag, lease.token, lease.holder, child_holder, self(), request_ref}
+          )
+
+          await_retain(lease, child_holder, request_ref, monitor_ref, timeout)
+        else
+          reason = owner_down_reason(monitor_ref, owner)
+          Process.demonitor(monitor_ref, [:flush])
+          {:error, {:owner_down, reason}}
+        end
+    end
+  end
+
+  defp await_retain(lease, child_holder, request_ref, monitor_ref, timeout) do
+    owner = lease.owner
 
     receive do
       {@retained_tag, ^request_ref, {:ok, child_guard}} ->
@@ -87,7 +108,7 @@ defmodule VideoInterop.Lease do
             {@confirm_retain_tag, lease.token, child_holder, request_ref}
           )
 
-          Process.unalias(request_ref)
+          cleanup_request(request_ref, monitor_ref)
 
           {:ok,
            %__MODULE__{
@@ -99,12 +120,17 @@ defmodule VideoInterop.Lease do
         else
           Process.unalias(request_ref)
           send(lease.owner, {@cancel_retain_tag, lease.token, child_holder})
+          Process.demonitor(monitor_ref, [:flush])
           {:error, :invalid_abandonment_guard}
         end
 
       {@retained_tag, ^request_ref, {:error, reason}} ->
-        Process.unalias(request_ref)
+        cleanup_request(request_ref, monitor_ref)
         {:error, reason}
+
+      {:DOWN, ^monitor_ref, :process, ^owner, reason} ->
+        Process.unalias(request_ref)
+        {:error, {:owner_down, reason}}
     after
       timeout ->
         # Messages from this process to the owner are ordered. The owner therefore sees this
@@ -113,7 +139,21 @@ defmodule VideoInterop.Lease do
         # instead of leaving it in the caller's mailbox.
         Process.unalias(request_ref)
         send(lease.owner, {@cancel_retain_tag, lease.token, child_holder})
+        Process.demonitor(monitor_ref, [:flush])
         {:error, :timeout}
+    end
+  end
+
+  defp cleanup_request(request_ref, monitor_ref) do
+    Process.unalias(request_ref)
+    Process.demonitor(monitor_ref, [:flush])
+  end
+
+  defp owner_down_reason(monitor_ref, owner) do
+    receive do
+      {:DOWN, ^monitor_ref, :process, ^owner, reason} -> reason
+    after
+      0 -> :noproc
     end
   end
 

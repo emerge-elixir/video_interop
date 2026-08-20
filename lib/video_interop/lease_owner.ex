@@ -6,13 +6,16 @@ defmodule VideoInterop.LeaseOwner do
   mailbox is reserved for lease lifecycle messages so media traffic in the
   producer cannot delay buffer retirement.
 
-  Issuance has an explicit ownership boundary. The caller owns a backend token
-  only when `issue/3` returns `{:error, {:caller_owned, reason}}`. Once the issue
-  request is sent, every error is tagged `:transferred` and the owner (or the
-  token's independent owner-crash destructor) is responsible for cleanup.
+  Issuance has an explicit ownership boundary. Capacity is reserved before the
+  backend token is sent. The caller owns the token until the reservation is
+  accepted and the token-bearing commit message is sent. Every later error is
+  tagged `:transferred`, and the owner (or the token's independent owner-crash
+  destructor) is responsible for cleanup.
 
-  Release callbacks used with automatic retry must be idempotent for one backend
-  token. Retry is single-flight per public lease token. Failed entries remain
+  Release callbacks run on one monitored serial executor so arbitrary callback
+  latency cannot block the owner mailbox. Callbacks used with automatic retry
+  must be idempotent for one backend token. Retry is single-flight per public
+  lease token. Failed entries remain
   alive and retryable after producer death or retry exhaustion; there is no
   implicit fatal policy based on observer liveness.
 
@@ -57,6 +60,7 @@ defmodule VideoInterop.LeaseOwner do
   @type stats :: %{
           state: :open | :draining,
           active_leases: non_neg_integer(),
+          issue_reservations: non_neg_integer(),
           active_holders: non_neg_integer(),
           oldest_lease_age_ns: non_neg_integer() | nil,
           issued_leases: non_neg_integer(),
@@ -75,6 +79,9 @@ defmodule VideoInterop.LeaseOwner do
           release_retries: non_neg_integer(),
           release_callback_total_ns: non_neg_integer(),
           release_callback_max_ns: non_neg_integer(),
+          release_executor_queue_depth: non_neg_integer(),
+          release_executor_active_age_ns: non_neg_integer() | nil,
+          release_executor_restarts: non_neg_integer(),
           malformed_messages: non_neg_integer(),
           release_tombstones: non_neg_integer(),
           release_tombstone_limit: pos_integer(),
@@ -85,25 +92,52 @@ defmodule VideoInterop.LeaseOwner do
   @doc """
   Starts a lease owner linked to the producing process.
 
-  The owner traps the producer's exit and drains issued leases instead of
-  releasing them early. `release_retry` defaults to `:manual`. Automatic
-  exponential retry requires an idempotent release callback. Before stopping
-  after successful drainage, the owner sends an immutable final-stats
-  notification followed by the existing two-field drained notification.
+  This intentionally uses an ordinary link rather than an OTP parent link so the
+  owner can trap producer exit and outlive it until every lease drains.
+  `release_retry` defaults to `:manual`. Automatic exponential retry requires an
+  idempotent release callback. Before stopping after successful drainage, the
+  owner sends an immutable final-stats notification followed by the existing
+  two-field drained notification.
   """
   @spec start_link([option()]) :: GenServer.on_start()
   def start_link(opts) do
     producer = Keyword.get(opts, :producer, self())
-    GenServer.start(__MODULE__, Keyword.put(opts, :producer, producer))
+
+    GenServer.start(
+      __MODULE__,
+      opts |> Keyword.put(:producer, producer) |> Keyword.put(:producer_lifecycle, :link)
+    )
+  end
+
+  @doc "Starts a supervisor-owned lease owner that monitors a distinct producer."
+  @spec start_supervised([option()]) :: GenServer.on_start()
+  def start_supervised(opts) do
+    with {:ok, _producer} <- Keyword.fetch(opts, :producer) do
+      GenServer.start_link(
+        __MODULE__,
+        Keyword.put(opts, :producer_lifecycle, :monitor)
+      )
+    end
+  end
+
+  @doc false
+  def child_spec(opts) do
+    %{
+      id: {__MODULE__, Keyword.get(opts, :producer)},
+      start: {__MODULE__, :start_supervised, [opts]},
+      restart: :temporary,
+      type: :worker
+    }
   end
 
   @doc """
   Transfers a private backend token to the owner and returns a confirmed lease.
 
-  The owner is monitored and checked before send. A `:caller_owned` error proves
-  that no issue request was sent. The send is the transfer boundary; capacity,
-  draining, timeout, release failure, and owner death after it are all
-  `:transferred` errors.
+  The owner is monitored and capacity is reserved before the backend token is
+  sent. Capacity, draining, timeout, or owner death before the token-bearing
+  commit are `:caller_owned` errors. Sending that commit is the transfer
+  boundary; every later timeout, release failure, or owner death is a
+  `:transferred` error.
 
   Because a local PID can die concurrently with send, backend tokens must also
   have an owner-crash/message-drop destructor fallback.
@@ -118,9 +152,10 @@ defmodule VideoInterop.LeaseOwner do
   end
 
   @doc "Stops accepting new issues and retains, then drains existing holders."
-  @spec close(pid(), timeout()) :: :ok | {:ok, :draining}
+  @spec close(pid(), timeout()) ::
+          :ok | {:ok, :draining} | {:error, :timeout | {:owner_down, term()}}
   def close(owner, timeout \\ 5_000) when is_pid(owner) do
-    GenServer.call(owner, :close, timeout)
+    safe_call(owner, :close, timeout)
   end
 
   @doc """
@@ -162,9 +197,10 @@ defmodule VideoInterop.LeaseOwner do
   end
 
   @doc "Returns lease counts, release timings, and mailbox depth."
-  @spec stats(pid(), timeout()) :: stats()
+  @spec stats(pid(), timeout()) ::
+          stats() | {:error, :timeout | {:owner_down, term()}}
   def stats(owner, timeout \\ 5_000) when is_pid(owner) do
-    GenServer.call(owner, :stats, timeout)
+    safe_call(owner, :stats, timeout)
   end
 
   @impl true
@@ -178,6 +214,7 @@ defmodule VideoInterop.LeaseOwner do
     notify_releases = Keyword.get(opts, :notify_releases, Keyword.has_key?(opts, :notify))
     release_retry = normalize_retry_policy(Keyword.get(opts, :release_retry, :manual))
     abandonment_guard_factory = Keyword.get(opts, :abandonment_guard_factory)
+    producer_lifecycle = Keyword.get(opts, :producer_lifecycle, :link)
 
     validate_options!(
       producer,
@@ -189,11 +226,22 @@ defmodule VideoInterop.LeaseOwner do
       abandonment_guard_factory
     )
 
-    Process.link(producer)
+    {release_executor, release_executor_monitor} = start_release_executor(release)
+
+    producer_monitor =
+      case producer_lifecycle do
+        :link ->
+          Process.link(producer)
+          nil
+
+        :monitor ->
+          Process.monitor(producer)
+      end
 
     {:ok,
      %{
        producer: producer,
+       producer_monitor: producer_monitor,
        notify: notify,
        notify_releases: notify_releases,
        release: release,
@@ -202,7 +250,14 @@ defmodule VideoInterop.LeaseOwner do
        max_active: max_active,
        mode: :open,
        leases: %{},
+       issue_reservations: %{},
        pending_issues: %{},
+       active_holders: 0,
+       lease_age_index: :gb_sets.empty(),
+       release_executor: release_executor,
+       release_executor_monitor: release_executor_monitor,
+       release_queue: :queue.new(),
+       release_job: nil,
        protocol_monitors: %{},
        drain_waiters: %{},
        drain_monitors: %{},
@@ -226,6 +281,7 @@ defmodule VideoInterop.LeaseOwner do
          release_retries: 0,
          release_callback_total_ns: 0,
          release_callback_max_ns: 0,
+         release_executor_restarts: 0,
          malformed_messages: 0
        }
      }}
@@ -235,7 +291,7 @@ defmodule VideoInterop.LeaseOwner do
   def handle_call(:close, _from, state) do
     state = %{state | mode: :draining}
 
-    if map_size(state.leases) == 0 do
+    if drained?(state) do
       state = complete_drain(state)
       {:stop, :normal, :ok, state}
     else
@@ -243,13 +299,19 @@ defmodule VideoInterop.LeaseOwner do
     end
   end
 
-  def handle_call({:retry, token}, _from, state) do
+  def handle_call({:retry, token}, from, state) do
     state = cancel_retry_timer(token, state)
 
     case Map.fetch(state.leases, token) do
       {:ok, %{status: {:release_failed, _reason}} = entry} ->
-        {reply, state} = release_entry(token, entry, state, retry?: true)
-        stop_or_reply_after_release(reply, state)
+        {_pending, state} =
+          release_entry(token, entry, state, retry?: true, waiter: {:retry, from})
+
+        {:noreply, state}
+
+      {:ok, %{status: {status, _generation}}}
+      when status in [:release_queued, :releasing] ->
+        {:reply, {:error, :release_in_progress}, state}
 
       {:ok, _entry} ->
         {:reply, {:error, :not_release_failed}, state}
@@ -263,67 +325,85 @@ defmodule VideoInterop.LeaseOwner do
 
   @impl true
   def handle_info(
-        {:video_interop_issue, backend_token, metadata, reply_to, request_ref},
+        {:video_interop_reserve_issue, metadata, reply_to, request_ref},
         state
       )
       when is_pid(reply_to) and node(reply_to) == node() and is_reference(request_ref) do
     cond do
       state.mode == :draining ->
-        reject_issue(:draining, backend_token, metadata, reply_to, request_ref, state)
+        reply_issue_reservation(reply_to, request_ref, {:error, :draining})
+        {:noreply, state}
 
       not capacity_available?(state) ->
-        reject_issue(:capacity, backend_token, metadata, reply_to, request_ref, state)
+        reply_issue_reservation(reply_to, request_ref, {:error, :capacity})
+        {:noreply, state}
 
       true ->
-        token = make_ref()
-        holder = make_ref()
+        reservation = make_ref()
+        monitor_ref = Process.monitor(reply_to)
 
-        case create_abandonment_guard(state.abandonment_guard_factory, token, holder) do
-          {:ok, abandonment_guard} ->
-            monitor_ref = Process.monitor(reply_to)
+        state =
+          state
+          |> put_in([:issue_reservations, request_ref], %{
+            reservation: reservation,
+            reply_to: reply_to,
+            monitor_ref: monitor_ref,
+            metadata: metadata
+          })
+          |> put_in([:protocol_monitors, monitor_ref], {:reservation, request_ref})
 
-            entry = %{
-              backend_token: backend_token,
-              holders: MapSet.new([holder]),
-              issued_at_ns: System.monotonic_time(:nanosecond),
-              metadata: metadata,
-              root_holder: holder,
-              pending_issue: {monitor_ref, request_ref},
-              pending_retains: %{},
-              release_attempts: 0,
-              status: :active
-            }
-
-            lease = %Lease{
-              owner: self(),
-              token: token,
-              holder: holder,
-              abandonment_guard: abandonment_guard
-            }
-
-            state =
-              state
-              |> put_in([:leases, token], entry)
-              |> put_in([:pending_issues, request_ref], token)
-              |> put_in([:protocol_monitors, monitor_ref], {:issue, token, request_ref})
-              |> update_counter(:issued_leases, 1)
-              |> update_counter(:issued_holders, 1)
-
-            reply_issue(reply_to, request_ref, {:ok, lease})
-            continue_after_guard_reply(abandonment_guard, state)
-
-          {:error, reason} ->
-            reject_issue(
-              {:abandonment_guard_factory_failed, reason},
-              backend_token,
-              metadata,
-              reply_to,
-              request_ref,
-              state,
-              token
-            )
-        end
+        reply_issue_reservation(reply_to, request_ref, {:ok, reservation})
+        {:noreply, state}
     end
+  end
+
+  def handle_info(
+        {:video_interop_commit_issue, reservation, backend_token, reply_to, request_ref},
+        state
+      )
+      when is_reference(reservation) and is_pid(reply_to) and node(reply_to) == node() and
+             is_reference(request_ref) do
+    case Map.fetch(state.issue_reservations, request_ref) do
+      {:ok,
+       %{
+         reservation: ^reservation,
+         reply_to: ^reply_to,
+         monitor_ref: monitor_ref,
+         metadata: metadata
+       }} ->
+        state =
+          state
+          |> update_in([:issue_reservations], &Map.delete(&1, request_ref))
+          |> put_in([:protocol_monitors, monitor_ref], {:issue_pending, request_ref})
+
+        commit_issue(
+          backend_token,
+          metadata,
+          reply_to,
+          request_ref,
+          monitor_ref,
+          state
+        )
+
+      _other ->
+        # A token-bearing commit without its bounded reservation is protocol corruption. Retaining
+        # it for callback retry would bypass max_active; stopping delegates every token to its
+        # mandatory owner-crash destructor without fabricating capacity.
+        notify(
+          state.notify,
+          {:video_interop_lease_owner_protocol_corruption, self(),
+           {:invalid_or_expired_reservation, reservation}}
+        )
+
+        _backend_token = backend_token
+        {:stop, {:invalid_or_expired_issue_reservation, reservation}, state}
+    end
+  end
+
+  def handle_info({:video_interop_cancel_issue_reservation, request_ref}, state)
+      when is_reference(request_ref) do
+    state = remove_issue_reservation(request_ref, state)
+    stop_or_continue_after_release(state)
   end
 
   def handle_info({:video_interop_abandoned, token, holder}, state)
@@ -480,7 +560,7 @@ defmodule VideoInterop.LeaseOwner do
         state = reply_drain_waiter(request_ref, {:error, {:release_failed, token, reason}}, state)
         {:noreply, state}
 
-      nil when map_size(state.leases) == 0 ->
+      nil when map_size(state.leases) == 0 and map_size(state.issue_reservations) == 0 ->
         state = complete_drain(state)
         {:stop, :normal, state}
 
@@ -494,6 +574,16 @@ defmodule VideoInterop.LeaseOwner do
     {:noreply, remove_drain_waiter(request_ref, state)}
   end
 
+  def handle_info(
+        {:video_interop_release_result, executor, token, generation, callback_result,
+         duration_ns},
+        %{release_executor: executor} = state
+      )
+      when is_reference(token) and is_reference(generation) and is_integer(duration_ns) and
+             duration_ns >= 0 do
+    finish_release_job(token, generation, callback_result, duration_ns, state)
+  end
+
   def handle_info({:video_interop_retry_release, token, generation}, state)
       when is_reference(token) and is_reference(generation) do
     case Map.fetch(state.retry_timers, token) do
@@ -502,8 +592,8 @@ defmodule VideoInterop.LeaseOwner do
 
         case Map.fetch(state.leases, token) do
           {:ok, %{status: {:release_failed, _reason}} = entry} ->
-            {_reply, state} = release_entry(token, entry, state, retry?: true)
-            stop_or_continue_after_release(state)
+            {_pending, state} = release_entry(token, entry, state, retry?: true)
+            {:noreply, state}
 
           _other ->
             {:noreply, state}
@@ -514,8 +604,14 @@ defmodule VideoInterop.LeaseOwner do
     end
   end
 
-  def handle_info({:DOWN, monitor_ref, :process, _pid, _reason}, state) do
+  def handle_info({:DOWN, monitor_ref, :process, _pid, reason}, state) do
     cond do
+      monitor_ref == state.producer_monitor ->
+        begin_producer_drain(state)
+
+      monitor_ref == state.release_executor_monitor ->
+        handle_release_executor_down(state, reason)
+
       Map.has_key?(state.protocol_monitors, monitor_ref) ->
         handle_protocol_down(monitor_ref, state)
 
@@ -529,21 +625,16 @@ defmodule VideoInterop.LeaseOwner do
   end
 
   def handle_info({:EXIT, producer, _reason}, %{producer: producer} = state) do
-    state = %{state | mode: :draining, producer: nil}
-
-    if map_size(state.leases) == 0 do
-      state = complete_drain(state)
-      {:stop, :normal, state}
-    else
-      {:noreply, state}
-    end
+    begin_producer_drain(state)
   end
 
   def handle_info(message, state) when is_tuple(message) and tuple_size(message) > 0 do
     case elem(message, 0) do
       tag
       when tag in [
-             :video_interop_issue,
+             :video_interop_reserve_issue,
+             :video_interop_commit_issue,
+             :video_interop_cancel_issue_reservation,
              :video_interop_confirm_issue,
              :video_interop_cancel_issue,
              :video_interop_retain,
@@ -564,8 +655,20 @@ defmodule VideoInterop.LeaseOwner do
 
   def handle_info(_message, state), do: {:noreply, state}
 
+  defp begin_producer_drain(state) do
+    state = %{state | mode: :draining, producer: nil, producer_monitor: nil}
+
+    if drained?(state) do
+      state = complete_drain(state)
+      {:stop, :normal, state}
+    else
+      {:noreply, state}
+    end
+  end
+
   defp do_issue(owner, backend_token, opts) do
     timeout = Keyword.get(opts, :timeout, 5_000)
+    deadline = request_deadline(timeout)
     monitor_ref = Process.monitor(owner)
 
     if Process.alive?(owner) do
@@ -573,10 +676,10 @@ defmodule VideoInterop.LeaseOwner do
 
       send(
         owner,
-        {:video_interop_issue, backend_token, Keyword.get(opts, :metadata), self(), request_ref}
+        {:video_interop_reserve_issue, Keyword.get(opts, :metadata), self(), request_ref}
       )
 
-      await_issue(owner, request_ref, monitor_ref, timeout)
+      await_issue_reservation(owner, backend_token, request_ref, monitor_ref, deadline)
     else
       reason = owner_down_reason(monitor_ref, owner)
       Process.demonitor(monitor_ref, [:flush])
@@ -584,7 +687,33 @@ defmodule VideoInterop.LeaseOwner do
     end
   end
 
-  defp await_issue(owner, request_ref, monitor_ref, timeout) do
+  defp await_issue_reservation(owner, backend_token, request_ref, monitor_ref, deadline) do
+    receive do
+      {:video_interop_issue_reserved, ^request_ref, {:ok, reservation}} ->
+        send(
+          owner,
+          {:video_interop_commit_issue, reservation, backend_token, self(), request_ref}
+        )
+
+        await_committed_issue(owner, request_ref, monitor_ref, deadline)
+
+      {:video_interop_issue_reserved, ^request_ref, {:error, reason}} ->
+        cleanup_request(request_ref, monitor_ref)
+        {:error, {:caller_owned, reason}}
+
+      {:DOWN, ^monitor_ref, :process, ^owner, reason} ->
+        Process.unalias(request_ref)
+        {:error, {:caller_owned, {:owner_down, reason}}}
+    after
+      remaining_timeout(deadline) ->
+        Process.unalias(request_ref)
+        send(owner, {:video_interop_cancel_issue_reservation, request_ref})
+        Process.demonitor(monitor_ref, [:flush])
+        {:error, {:caller_owned, :timeout}}
+    end
+  end
+
+  defp await_committed_issue(owner, request_ref, monitor_ref, deadline) do
     receive do
       {:video_interop_issued, ^request_ref, {:ok, %Lease{} = lease}} ->
         send(owner, {:video_interop_confirm_issue, lease.token, request_ref})
@@ -599,12 +728,24 @@ defmodule VideoInterop.LeaseOwner do
         Process.unalias(request_ref)
         {:error, {:transferred, {:owner_down, reason}}}
     after
-      timeout ->
+      remaining_timeout(deadline) ->
         Process.unalias(request_ref)
         send(owner, {:video_interop_cancel_issue, request_ref})
         Process.demonitor(monitor_ref, [:flush])
         {:error, {:transferred, :timeout}}
     end
+  end
+
+  defp request_deadline(:infinity), do: :infinity
+
+  defp request_deadline(timeout) when is_integer(timeout) and timeout >= 0 do
+    System.monotonic_time(:millisecond) + timeout
+  end
+
+  defp remaining_timeout(:infinity), do: :infinity
+
+  defp remaining_timeout(deadline) do
+    max(deadline - System.monotonic_time(:millisecond), 0)
   end
 
   defp await_drain(owner, request_ref, monitor_ref, timeout) do
@@ -681,6 +822,7 @@ defmodule VideoInterop.LeaseOwner do
                   state
                   |> put_in([:leases, token], entry)
                   |> put_in([:protocol_monitors, monitor_ref], {:retain, token, child_holder})
+                  |> Map.update!(:active_holders, &(&1 + 1))
                   |> update_counter(:issued_holders, 1)
 
                 reply_retain(reply_to, request_ref, {:ok, child_guard})
@@ -709,6 +851,16 @@ defmodule VideoInterop.LeaseOwner do
 
   defp handle_protocol_down(monitor_ref, state) do
     case Map.pop(state.protocol_monitors, monitor_ref) do
+      {{:reservation, request_ref}, protocol_monitors} ->
+        state = %{state | protocol_monitors: protocol_monitors}
+        state = remove_issue_reservation(request_ref, state, demonitor?: false)
+        stop_or_continue_after_release(state)
+
+      {{:issue_pending, request_ref}, protocol_monitors} ->
+        state = %{state | protocol_monitors: protocol_monitors}
+        state = remove_issue_reservation(request_ref, state, demonitor?: false)
+        stop_or_continue_after_release(state)
+
       {{:retain, token, child_holder}, protocol_monitors} ->
         state = %{state | protocol_monitors: protocol_monitors}
 
@@ -730,6 +882,87 @@ defmodule VideoInterop.LeaseOwner do
     end
   end
 
+  defp commit_issue(
+         backend_token,
+         metadata,
+         reply_to,
+         request_ref,
+         monitor_ref,
+         state
+       ) do
+    token = make_ref()
+    holder = make_ref()
+
+    case create_abandonment_guard(state.abandonment_guard_factory, token, holder) do
+      {:ok, abandonment_guard} ->
+        issued_at_ns = System.monotonic_time(:nanosecond)
+
+        entry = %{
+          backend_token: backend_token,
+          holders: MapSet.new([holder]),
+          issued_at_ns: issued_at_ns,
+          metadata: metadata,
+          root_holder: holder,
+          pending_issue: {monitor_ref, request_ref},
+          pending_retains: %{},
+          release_attempts: 0,
+          status: :active
+        }
+
+        lease = %Lease{
+          owner: self(),
+          token: token,
+          holder: holder,
+          abandonment_guard: abandonment_guard
+        }
+
+        state =
+          state
+          |> put_in([:leases, token], entry)
+          |> put_in([:pending_issues, request_ref], token)
+          |> put_in([:protocol_monitors, monitor_ref], {:issue, token, request_ref})
+          |> Map.update!(:active_holders, &(&1 + 1))
+          |> Map.update!(:lease_age_index, &:gb_sets.add({issued_at_ns, token}, &1))
+          |> update_counter(:issued_leases, 1)
+          |> update_counter(:issued_holders, 1)
+
+        reply_issue(reply_to, request_ref, {:ok, lease})
+        continue_after_guard_reply(abandonment_guard, state)
+
+      {:error, reason} ->
+        Process.demonitor(monitor_ref, [:flush])
+        state = update_in(state.protocol_monitors, &Map.delete(&1, monitor_ref))
+
+        reject_issue(
+          {:abandonment_guard_factory_failed, reason},
+          backend_token,
+          metadata,
+          reply_to,
+          request_ref,
+          state,
+          token
+        )
+    end
+  end
+
+  defp remove_issue_reservation(request_ref, state, opts \\ []) do
+    case Map.pop(state.issue_reservations, request_ref) do
+      {%{monitor_ref: monitor_ref}, issue_reservations} ->
+        if Keyword.get(opts, :demonitor?, true) do
+          Process.demonitor(monitor_ref, [:flush])
+        end
+
+        %{
+          state
+          | issue_reservations: issue_reservations,
+            protocol_monitors: Map.delete(state.protocol_monitors, monitor_ref)
+        }
+
+      {nil, _issue_reservations} ->
+        state
+    end
+  end
+
   defp reject_issue(
          reason,
          backend_token,
@@ -737,12 +970,14 @@ defmodule VideoInterop.LeaseOwner do
          reply_to,
          request_ref,
          state,
-         token \\ make_ref()
+         token
        ) do
+    issued_at_ns = System.monotonic_time(:nanosecond)
+
     entry = %{
       backend_token: backend_token,
       holders: MapSet.new(),
-      issued_at_ns: System.monotonic_time(:nanosecond),
+      issued_at_ns: issued_at_ns,
       metadata: metadata,
       root_holder: nil,
       pending_issue: nil,
@@ -751,23 +986,29 @@ defmodule VideoInterop.LeaseOwner do
       status: :active
     }
 
-    {release_result, state} = release_entry(token, entry, state)
+    state =
+      state
+      |> put_in([:leases, token], entry)
+      |> Map.update!(:lease_age_index, &:gb_sets.add({issued_at_ns, token}, &1))
 
-    reply =
-      case release_result do
-        :ok -> {:error, reason}
-        {:error, release_reason} -> {:error, {reason, {:release_failed, token, release_reason}}}
-      end
+    {_pending, state} =
+      release_entry(
+        token,
+        entry,
+        state,
+        waiter: {:issue, reply_to, request_ref, reason}
+      )
 
-    reply_issue(reply_to, request_ref, reply)
-    stop_or_continue_after_release(state)
+    {:noreply, state}
   end
 
   defp cancel_pending_issue(token, state) do
     case Map.fetch(state.leases, token) do
       {:ok, %{status: :active, pending_issue: {_monitor_ref, _request_ref}} = entry} ->
         {entry, state} = clear_pending_issue(entry, state)
+        removed_holders = MapSet.size(entry.holders)
         entry = %{entry | holders: MapSet.new()}
+        state = Map.update!(state, :active_holders, &max(&1 - removed_holders, 0))
         {_result, state} = release_entry(token, entry, state)
         stop_or_continue_after_release(state)
 
@@ -807,6 +1048,7 @@ defmodule VideoInterop.LeaseOwner do
   defp remove_holder(token, holder, entry, state) do
     if MapSet.member?(entry.holders, holder) do
       holders = MapSet.delete(entry.holders, holder)
+      state = Map.update!(state, :active_holders, &max(&1 - 1, 0))
 
       if MapSet.size(holders) == 0 do
         {_result, state} = release_entry(token, %{entry | holders: holders}, state)
@@ -824,48 +1066,189 @@ defmodule VideoInterop.LeaseOwner do
     {entry, state} = clear_all_pending_retains(entry, state)
     state = cancel_retry_timer(token, state)
     attempt = entry.release_attempts + 1
-    started_ns = System.monotonic_time(:nanosecond)
-    callback_result = invoke_release(state.release, entry.backend_token)
-    duration_ns = max(System.monotonic_time(:nanosecond) - started_ns, 0)
+    generation = make_ref()
+    retry? = Keyword.get(opts, :retry?, false)
+    waiter = Keyword.get(opts, :waiter)
+    entry = %{entry | release_attempts: attempt, status: {:release_queued, generation}}
+
+    job = %{
+      token: token,
+      generation: generation,
+      backend_token: entry.backend_token,
+      attempt: attempt,
+      retry?: retry?,
+      waiter: waiter
+    }
 
     state =
       state
-      |> update_counter(:release_callbacks, 1)
-      |> maybe_count_retry(Keyword.get(opts, :retry?, false))
-      |> update_counter(:release_callback_total_ns, duration_ns)
-      |> update_counter(:release_callback_max_ns, duration_ns, &max/2)
+      |> put_in([:leases, token], entry)
+      |> Map.update!(:release_queue, &:queue.in(job, &1))
+      |> dispatch_next_release()
 
-    case callback_result do
-      {:ok, value} ->
-        state = %{state | leases: Map.delete(state.leases, token)}
+    {:pending, state}
+  end
 
-        if state.notify_releases do
-          notify(
-            state.notify,
-            {:video_interop_lease_released, self(), token, entry.metadata,
-             %{result: value, release_callback_ns: duration_ns, attempt: attempt}}
-          )
-        end
+  defp dispatch_next_release(%{release_job: nil} = state) do
+    case :queue.out(state.release_queue) do
+      {{:value, job}, release_queue} ->
+        started_ns = System.monotonic_time(:nanosecond)
 
-        {:ok, state}
-
-      {:error, reason} ->
-        failed_entry = %{entry | release_attempts: attempt, status: {:release_failed, reason}}
-
-        state =
-          state
-          |> put_in([:leases, token], failed_entry)
-          |> update_counter(:release_failures, 1)
-
-        notify(
-          state.notify,
-          {:video_interop_lease_release_failed, self(), token, entry.metadata, reason}
+        send(
+          state.release_executor,
+          {:video_interop_execute_release, job.token, job.generation, job.backend_token}
         )
 
-        state = reply_all_drain_waiters({:error, {:release_failed, token, reason}}, state)
-        state = schedule_retry(token, failed_entry, state)
-        {{:error, reason}, state}
+        state
+        |> Map.put(:release_queue, release_queue)
+        |> Map.put(:release_job, Map.put(job, :started_ns, started_ns))
+        |> put_in([:leases, job.token, :status], {:releasing, job.generation})
+
+      {:empty, _release_queue} ->
+        state
     end
+  end
+
+  defp dispatch_next_release(state), do: state
+
+  defp finish_release_job(token, generation, callback_result, duration_ns, state) do
+    case {state.release_job, Map.fetch(state.leases, token)} do
+      {%{token: ^token, generation: ^generation} = job,
+       {:ok, %{status: {:releasing, ^generation}} = entry}} ->
+        state =
+          state
+          |> Map.put(:release_job, nil)
+          |> update_counter(:release_callbacks, 1)
+          |> maybe_count_retry(job.retry?)
+          |> update_counter(:release_callback_total_ns, duration_ns)
+          |> update_counter(:release_callback_max_ns, duration_ns, &max/2)
+
+        state =
+          case callback_result do
+            {:ok, value} ->
+              state = %{
+                state
+                | leases: Map.delete(state.leases, token),
+                  lease_age_index:
+                    :gb_sets.delete_any({entry.issued_at_ns, token}, state.lease_age_index)
+              }
+
+              if state.notify_releases do
+                notify(
+                  state.notify,
+                  {:video_interop_lease_released, self(), token, entry.metadata,
+                   %{result: value, release_callback_ns: duration_ns, attempt: job.attempt}}
+                )
+              end
+
+              reply_release_waiter(job.waiter, :ok, token, nil)
+              state
+
+            {:error, reason} ->
+              failed_entry = %{entry | status: {:release_failed, reason}}
+
+              state =
+                state
+                |> put_in([:leases, token], failed_entry)
+                |> update_counter(:release_failures, 1)
+
+              notify(
+                state.notify,
+                {:video_interop_lease_release_failed, self(), token, entry.metadata, reason}
+              )
+
+              reply_release_waiter(job.waiter, {:error, reason}, token, reason)
+
+              state =
+                reply_all_drain_waiters(
+                  {:error, {:release_failed, token, reason}},
+                  state
+                )
+
+              schedule_retry(token, failed_entry, state)
+          end
+
+        state = dispatch_next_release(state)
+        stop_or_continue_after_release(state)
+
+      _other ->
+        {:noreply, update_counter(state, :malformed_messages, 1)}
+    end
+  end
+
+  defp reply_release_waiter(nil, _result, _token, _reason), do: :ok
+
+  defp reply_release_waiter({:retry, from}, result, _token, _reason),
+    do: GenServer.reply(from, result)
+
+  defp reply_release_waiter({:issue, reply_to, request_ref, reject_reason}, result, token, reason) do
+    reply =
+      case result do
+        :ok ->
+          {:error, reject_reason}
+
+        {:error, _release_reason} ->
+          {:error, {reject_reason, {:release_failed, token, reason}}}
+      end
+
+    reply_issue(reply_to, request_ref, reply)
+  end
+
+  defp handle_release_executor_down(state, reason) do
+    state = update_counter(state, :release_executor_restarts, 1)
+    {executor, monitor_ref} = start_release_executor(state.release)
+    state = %{state | release_executor: executor, release_executor_monitor: monitor_ref}
+
+    case state.release_job do
+      nil ->
+        {:noreply, dispatch_next_release(state)}
+
+      %{token: token, generation: generation} ->
+        finish_release_job(
+          token,
+          generation,
+          {:error, {:release_executor_down, reason}},
+          release_job_age_ns(state.release_job),
+          state
+        )
+    end
+  end
+
+  defp start_release_executor(callback) do
+    owner = self()
+
+    spawn_monitor(fn ->
+      owner_monitor = Process.monitor(owner)
+      release_executor_loop(owner, owner_monitor, callback)
+    end)
+  end
+
+  defp release_executor_loop(owner, owner_monitor, callback) do
+    receive do
+      {:video_interop_execute_release, token, generation, backend_token} ->
+        started_ns = System.monotonic_time(:nanosecond)
+        result = invoke_release(callback, backend_token)
+        duration_ns = max(System.monotonic_time(:nanosecond) - started_ns, 0)
+
+        send(
+          owner,
+          {:video_interop_release_result, self(), token, generation, result, duration_ns}
+        )
+
+        release_executor_loop(owner, owner_monitor, callback)
+
+      {:DOWN, ^owner_monitor, :process, ^owner, _reason} ->
+        :ok
+
+      :video_interop_stop_release_executor ->
+        :ok
+    end
+  end
+
+  defp release_job_age_ns(nil), do: nil
+
+  defp release_job_age_ns(job) do
+    max(System.monotonic_time(:nanosecond) - job.started_ns, 0)
   end
 
   defp clear_all_pending_retains(entry, state) do
@@ -880,7 +1263,7 @@ defmodule VideoInterop.LeaseOwner do
   end
 
   defp stop_or_continue_after_release(state) do
-    if state.mode == :draining and map_size(state.leases) == 0 do
+    if state.mode == :draining and drained?(state) do
       state = complete_drain(state)
       {:stop, :normal, state}
     else
@@ -888,16 +1271,8 @@ defmodule VideoInterop.LeaseOwner do
     end
   end
 
-  defp stop_or_reply_after_release(reply, state) do
-    if reply == :ok and state.mode == :draining and map_size(state.leases) == 0 do
-      state = complete_drain(state)
-      {:stop, :normal, :ok, state}
-    else
-      {:reply, reply, state}
-    end
-  end
-
   defp complete_drain(state) do
+    send(state.release_executor, :video_interop_stop_release_executor)
     state = reply_all_drain_waiters(:ok, state)
     final_stats = stats_snapshot(state)
     notify(state.notify, {:video_interop_lease_owner_final_stats, self(), final_stats})
@@ -1029,6 +1404,14 @@ defmodule VideoInterop.LeaseOwner do
     {:noreply, state}
   end
 
+  defp reply_issue_reservation(reply_to, request_ref, result) do
+    reply_via_alias(
+      reply_to,
+      request_ref,
+      {:video_interop_issue_reserved, request_ref, result}
+    )
+  end
+
   defp reply_issue(reply_to, request_ref, result) do
     reply_via_alias(reply_to, request_ref, {:video_interop_issued, request_ref, result})
   end
@@ -1055,21 +1438,26 @@ defmodule VideoInterop.LeaseOwner do
   defp continue_after_guard_reply(nil, state), do: {:noreply, state}
 
   defp capacity_available?(%{max_active: :infinity}), do: true
-  defp capacity_available?(state), do: map_size(state.leases) < state.max_active
+
+  defp capacity_available?(state) do
+    map_size(state.leases) + map_size(state.issue_reservations) < state.max_active
+  end
+
+  defp drained?(state) do
+    map_size(state.leases) == 0 and map_size(state.issue_reservations) == 0 and
+      state.release_job == nil and :queue.is_empty(state.release_queue)
+  end
 
   defp stats_snapshot(state) do
     now_ns = System.monotonic_time(:nanosecond)
 
     oldest_lease_age_ns =
-      state.leases
-      |> Map.values()
-      |> Enum.map(&max(now_ns - &1.issued_at_ns, 0))
-      |> Enum.max(fn -> nil end)
-
-    active_holders =
-      state.leases
-      |> Map.values()
-      |> Enum.reduce(0, &(MapSet.size(&1.holders) + &2))
+      if :gb_sets.is_empty(state.lease_age_index) do
+        nil
+      else
+        {issued_at_ns, _token} = :gb_sets.smallest(state.lease_age_index)
+        max(now_ns - issued_at_ns, 0)
+      end
 
     queue_len =
       case Process.info(self(), :message_queue_len) do
@@ -1081,11 +1469,14 @@ defmodule VideoInterop.LeaseOwner do
     |> Map.merge(%{
       state: state.mode,
       active_leases: map_size(state.leases),
-      active_holders: active_holders,
+      issue_reservations: map_size(state.issue_reservations),
+      active_holders: state.active_holders,
       oldest_lease_age_ns: oldest_lease_age_ns,
       release_tombstones: map_size(state.release_tombstones),
       release_tombstone_limit: @release_tombstone_limit,
       drain_waiters: map_size(state.drain_waiters),
+      release_executor_queue_depth: :queue.len(state.release_queue),
+      release_executor_active_age_ns: release_job_age_ns(state.release_job),
       message_queue_len: queue_len
     })
   end

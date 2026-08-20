@@ -45,7 +45,9 @@ alias VideoInterop.DMABuf.{Descriptor, FourCC, Layer, Object, Plane}
 {:ok, lease} = LeaseOwner.issue(lease_owner, backend_token)
 
 descriptor = %Descriptor{
-  objects: [%Object{fd: fd, size: 5_529_600, modifier: 0}],
+  # 5_529_600 bytes contain visible NV12 pixels. The complete producer allocation includes
+  # a truthful 256-byte V3DV transfer read-ahead tail that no copy region references.
+  objects: [%Object{fd: fd, size: 5_529_856, modifier: 0}],
   layers: [
     %Layer{
       fourcc: FourCC.nv12(),
@@ -113,10 +115,12 @@ case LeaseOwner.issue(owner, backend_token) do
 end
 ```
 
-The send operation is the ownership boundary. Backend tokens also require an
-owner-crash/message-drop destructor fallback. A holder must never be copied to
-another consumer; use `VideoInterop.retain/2` to return the same frame with a
-unique child holder.
+Issuance first reserves capacity without sending the backend token. The
+subsequent token-bearing commit send is the ownership boundary. Capacity,
+draining, and pre-commit timeout errors are therefore caller-owned; later errors
+are transferred. Backend tokens still require an owner-crash/message-drop
+destructor fallback. A holder must never be copied to another consumer; use
+`VideoInterop.retain/2` to return the same frame with a unique child holder.
 
 When configured, `abandonment_guard_factory` runs transactionally before a
 root or retained holder is published. It must return a fresh
@@ -137,9 +141,11 @@ ordered release tombstones. Recognized explicit-after-fallback races increase
 the existing `{:video_interop_lease_owner_drained, owner}` notification.
 
 `LeaseOwner.close/2` begins draining without waiting. `LeaseOwner.drain/2`
-registers a waiter atomically and returns only after all holders and final
-release callbacks complete. Optional single-flight exponential release retry is
-available for idempotent backend callbacks:
+registers a waiter atomically and returns only after all reservations, holders,
+and final release callbacks complete. Release callbacks run on one monitored
+serial executor, so a blocked callback cannot block the lease-owner mailbox.
+Optional single-flight exponential release retry is available for idempotent
+backend callbacks:
 
 ```elixir
 release_retry:
@@ -219,7 +225,9 @@ exact holder/claim drainage, the lifecycle owner must call
 `ReleaseDispatcher::close_and_join` from a dirty-I/O NIF. It stops admission,
 drains the FIFO, and joins the worker. Resource and guard destructors never
 wait, join, or send through an `OwnedEnv`; an unjoined final owner is fatal, as
-is queue loss or worker panic after publication.
+is channel loss or worker panic after publication. Delivery to an already-dead
+local lease owner is counted as undelivered and delegates cleanup to the
+producer/owner-crash destructor instead of corrupting the healthy dispatcher.
 
 ## Migration plan
 
@@ -236,8 +244,10 @@ runtime.
 
 The `vulkan` feature accepts a caller-selected `ash` device and owns generic
 DMA-BUF capability queries, memory import, `SYNC_FD` acquire, external queue
-ownership, and release-fence retirement. Directly sampleable images stay
-zero-copy. Linear NV12 can use asynchronous bounded plane-for-plane transfer into
+ownership, and release-fence retirement. It verifies each published allocation
+size against the fd-backed DMA-BUF size before import and requires the device
+context to serialize queue host access with its renderer. Directly sampleable
+images stay zero-copy and use the same bounded persistent source cache. Linear NV12 can use asynchronous bounded plane-for-plane transfer into
 one optimal multi-planar NV12 image for hardware sampler YCbCr conversion, or into
 separate optimal Y/UV images when exact hardware chroma filtering is unavailable.
 The logical Vulkan transfer buffer ends at the final copied plane byte, independently

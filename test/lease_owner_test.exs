@@ -23,10 +23,10 @@ defmodule VideoInterop.LeaseOwnerTest do
     assert is_reference(lease.token)
     assert is_reference(lease.holder)
 
-    assert {:error, {:transferred, :capacity}} =
+    assert {:error, {:caller_owned, :capacity}} =
              LeaseOwner.issue(owner, :other_surface)
 
-    assert_receive {:backend_released, :other_surface}
+    refute_receive {:backend_released, :other_surface}
 
     assert :ok = Lease.release(lease)
     assert_receive {:backend_released, :surface}
@@ -38,13 +38,13 @@ defmodule VideoInterop.LeaseOwnerTest do
     stats = LeaseOwner.stats(owner)
     assert stats.active_leases == 0
     assert stats.active_holders == 0
-    assert stats.release_callbacks == 2
+    assert stats.release_callbacks == 1
     assert stats.release_failures == 0
 
     assert :ok = LeaseOwner.close(owner)
   end
 
-  test "ordered cancellation releases an issue whose reply times out" do
+  test "ordered cancellation removes a reservation whose reply times out" do
     test_pid = self()
 
     {:ok, owner} =
@@ -58,18 +58,18 @@ defmodule VideoInterop.LeaseOwnerTest do
 
     :ok = :sys.suspend(owner)
 
-    assert {:error, {:transferred, :timeout}} =
+    assert {:error, {:caller_owned, :timeout}} =
              LeaseOwner.issue(owner, :surface, timeout: 10)
 
     :ok = :sys.resume(owner)
 
-    assert_receive {:backend_released, :surface}
+    refute_receive {:backend_released, :surface}
     refute_receive {:video_interop_issued, _request_ref, _result}
     eventually(fn -> LeaseOwner.stats(owner).active_leases == 0 end)
     assert :ok = LeaseOwner.close(owner)
   end
 
-  test "a timed-out issue rejected at capacity still releases its backend token" do
+  test "a timed-out reservation at capacity leaves its backend token caller-owned" do
     test_pid = self()
 
     {:ok, owner} =
@@ -85,12 +85,12 @@ defmodule VideoInterop.LeaseOwnerTest do
     assert {:ok, root} = LeaseOwner.issue(owner, :active)
     :ok = :sys.suspend(owner)
 
-    assert {:error, {:transferred, :timeout}} =
+    assert {:error, {:caller_owned, :timeout}} =
              LeaseOwner.issue(owner, :timed_out, timeout: 10)
 
     :ok = :sys.resume(owner)
 
-    assert_receive {:backend_released, :timed_out}
+    refute_receive {:backend_released, :timed_out}
     assert :ok = Lease.release(root)
     assert_receive {:backend_released, :active}
     assert :ok = LeaseOwner.close(owner)
@@ -111,9 +111,21 @@ defmodule VideoInterop.LeaseOwnerTest do
     caller =
       spawn(fn ->
         request_ref = Process.alias()
-        send(owner, {:video_interop_issue, :surface, nil, self(), request_ref})
-        send(test_pid, {:issue_sent, self()})
-        Process.sleep(:infinity)
+        send(owner, {:video_interop_reserve_issue, nil, self(), request_ref})
+
+        receive do
+          {:video_interop_issue_reserved, ^request_ref, {:ok, reservation}} ->
+            send(
+              owner,
+              {:video_interop_commit_issue, reservation, :surface, self(), request_ref}
+            )
+        end
+
+        receive do
+          {:video_interop_issued, ^request_ref, {:ok, _lease}} ->
+            send(test_pid, {:issue_sent, self()})
+            Process.sleep(:infinity)
+        end
       end)
 
     assert_receive {:issue_sent, ^caller}
@@ -203,6 +215,111 @@ defmodule VideoInterop.LeaseOwnerTest do
     assert_receive {:backend_released, :frame}
     eventually(fn -> LeaseOwner.stats(owner).active_leases == 0 end)
     assert :ok = LeaseOwner.close(owner)
+  end
+
+  test "a blocked release callback does not block the owner mailbox" do
+    test_pid = self()
+
+    {:ok, owner} =
+      LeaseOwner.start_link(
+        producer: self(),
+        release: fn token ->
+          send(test_pid, {:release_callback_started, self(), token})
+
+          receive do
+            :complete_release -> :ok
+          end
+        end
+      )
+
+    assert {:ok, lease} = LeaseOwner.issue(owner, :blocked_release)
+    assert :ok = Lease.release(lease)
+    assert_receive {:release_callback_started, executor, :blocked_release}
+
+    started = System.monotonic_time(:millisecond)
+    stats = LeaseOwner.stats(owner, 100)
+    assert stats.active_leases == 1
+    assert stats.release_executor_active_age_ns >= 0
+    assert System.monotonic_time(:millisecond) - started < 100
+
+    send(executor, :complete_release)
+    eventually(fn -> LeaseOwner.stats(owner).active_leases == 0 end)
+    assert :ok = LeaseOwner.close(owner)
+  end
+
+  test "failed committed issues remain inside finite capacity" do
+    test_pid = self()
+    {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
+    factory = fn _owner, _token, _holder -> {:error, :injected_guard_failure} end
+
+    {:ok, owner} =
+      LeaseOwner.start_link(
+        producer: self(),
+        max_active: 1,
+        abandonment_guard_factory: factory,
+        release: fn token ->
+          attempt = Agent.get_and_update(attempts, &{&1 + 1, &1 + 1})
+          send(test_pid, {:bounded_release, token, attempt})
+          if attempt == 1, do: {:error, :busy}, else: :ok
+        end
+      )
+
+    assert {:error,
+            {:transferred,
+             {{:abandonment_guard_factory_failed, :injected_guard_failure},
+              {:release_failed, public_token, :busy}}}} =
+             LeaseOwner.issue(owner, :first)
+
+    assert_receive {:bounded_release, :first, 1}
+    assert LeaseOwner.stats(owner).active_leases == 1
+    assert {:error, {:caller_owned, :capacity}} = LeaseOwner.issue(owner, :second)
+    refute_receive {:bounded_release, :second, _attempt}
+
+    assert :ok = LeaseOwner.retry(owner, public_token)
+    assert_receive {:bounded_release, :first, 2}
+    assert :ok = LeaseOwner.close(owner)
+  end
+
+  test "release executor crashes are visible and retryable" do
+    test_pid = self()
+    {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
+    {:ok, owner} =
+      LeaseOwner.start_link(
+        producer: self(),
+        release_retry: {:exponential, initial_ms: 1, max_ms: 1, max_attempts: :infinity},
+        release: fn token ->
+          attempt = Agent.get_and_update(attempts, &{&1 + 1, &1 + 1})
+          send(test_pid, {:executor_attempt, token, attempt})
+          if attempt == 1, do: Process.exit(self(), :kill), else: :ok
+        end
+      )
+
+    assert {:ok, lease} = LeaseOwner.issue(owner, :executor_crash)
+    assert :ok = Lease.release(lease)
+    assert_receive {:executor_attempt, :executor_crash, 1}
+    assert_receive {:executor_attempt, :executor_crash, 2}
+    eventually(fn -> LeaseOwner.stats(owner).active_leases == 0 end)
+    assert LeaseOwner.stats(owner).release_executor_restarts == 1
+    assert :ok = LeaseOwner.close(owner)
+  end
+
+  test "supervisor-owned start monitors and drains a distinct producer" do
+    producer = spawn(fn -> Process.sleep(:infinity) end)
+
+    {:ok, owner} =
+      LeaseOwner.start_supervised(
+        producer: producer,
+        release: fn _token -> :ok end
+      )
+
+    monitor = Process.monitor(owner)
+    assert {:ok, lease} = LeaseOwner.issue(owner, :supervised)
+    Process.exit(producer, :kill)
+    eventually(fn -> LeaseOwner.stats(owner).state == :draining end)
+    assert :ok = Lease.release(lease)
+    assert_receive {:DOWN, ^monitor, :process, ^owner, :normal}
   end
 
   test "release bypasses a blocked producer mailbox" do
@@ -326,6 +443,32 @@ defmodule VideoInterop.LeaseOwnerTest do
     end
   end
 
+  test "token-bearing commits without reservations terminate instead of bypassing capacity" do
+    previous_trap_exit = Process.flag(:trap_exit, true)
+
+    try do
+      {:ok, owner} =
+        LeaseOwner.start_link(
+          producer: self(),
+          max_active: 1,
+          release: fn token -> send(self(), {:unexpected_release, token}) end
+        )
+
+      assert {:ok, _lease} = LeaseOwner.issue(owner, :active)
+      reservation = make_ref()
+
+      send(
+        owner,
+        {:video_interop_commit_issue, reservation, :unreserved, self(), make_ref()}
+      )
+
+      assert_receive {:EXIT, ^owner, {:invalid_or_expired_issue_reservation, ^reservation}}
+      refute_receive {:unexpected_release, :unreserved}
+    after
+      Process.flag(:trap_exit, previous_trap_exit)
+    end
+  end
+
   test "ignores malformed protocol messages without crashing" do
     {:ok, owner} =
       LeaseOwner.start_link(
@@ -388,17 +531,23 @@ defmodule VideoInterop.LeaseOwnerTest do
     assert System.monotonic_time(:millisecond) - started < 100
   end
 
-  test "owner death after send reports transferred ownership and clears monitor messages" do
+  test "owner death after commit reports transferred ownership and clears monitor messages" do
     test_pid = self()
 
     owner =
       spawn(fn ->
         receive do
-          {:video_interop_issue, :surface, nil, reply_to, request_ref} ->
-            send(test_pid, :issue_received)
-            send(request_ref, {:video_interop_issued, request_ref, {:error, :shutting_down}})
-            send(test_pid, {:reply_target, reply_to})
-            exit(:shutdown)
+          {:video_interop_reserve_issue, nil, reply_to, request_ref} ->
+            reservation = make_ref()
+            send(request_ref, {:video_interop_issue_reserved, request_ref, {:ok, reservation}})
+
+            receive do
+              {:video_interop_commit_issue, ^reservation, :surface, ^reply_to, ^request_ref} ->
+                send(test_pid, :issue_received)
+                send(request_ref, {:video_interop_issued, request_ref, {:error, :shutting_down}})
+                send(test_pid, {:reply_target, reply_to})
+                exit(:shutdown)
+            end
         end
       end)
 
@@ -408,7 +557,7 @@ defmodule VideoInterop.LeaseOwnerTest do
     refute_receive {:DOWN, _monitor, :process, ^owner, _reason}
   end
 
-  test "owner death while an issue is in flight reports transferred ownership" do
+  test "owner death while a reservation is in flight reports caller ownership" do
     previous_trap_exit = Process.flag(:trap_exit, true)
 
     try do
@@ -420,7 +569,7 @@ defmodule VideoInterop.LeaseOwnerTest do
       eventually(fn -> elem(Process.info(owner, :message_queue_len), 1) >= 1 end)
       Process.exit(owner, :kill)
 
-      assert {:error, {:transferred, {:owner_down, :killed}}} = Task.await(issuer)
+      assert {:error, {:caller_owned, {:owner_down, :killed}}} = Task.await(issuer)
       assert_receive {:EXIT, ^owner, :killed}
     after
       Process.flag(:trap_exit, previous_trap_exit)
@@ -445,10 +594,10 @@ defmodule VideoInterop.LeaseOwnerTest do
 
     assert {:error, :draining} = Lease.retain(root)
 
-    assert {:error, {:transferred, :draining}} =
+    assert {:error, {:caller_owned, :draining}} =
              LeaseOwner.issue(owner, :rejected)
 
-    assert_receive {:backend_released, :rejected}
+    refute_receive {:backend_released, :rejected}
     assert :ok = Lease.release(root)
     assert_receive {:backend_released, :root}
     assert :ok = Task.await(drain_task)

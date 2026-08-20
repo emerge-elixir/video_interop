@@ -1,5 +1,10 @@
 # Plans
 
+- [`video-interop-audit.md`](video-interop-audit.md) — bottom-up safety, lifecycle, Vulkan,
+  testing, and maintainability audit with prioritized findings.
+- [`video-interop-audit-remediation.md`](video-interop-audit-remediation.md) — detailed phased
+  implementation, migration, testing, target qualification, and rollback plan for every audit
+  finding.
 - [`library-owned-video-lifecycle.md`](library-owned-video-lifecycle.md) —
   approved architecture and detailed implementation plan that moves frame
   consumption, retirement, renderer draining, direct Emerge connections, and

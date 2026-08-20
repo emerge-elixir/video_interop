@@ -29,3 +29,14 @@
   entering any copy region.
 - Isolate host-built Rust schema test NIFs under the ignored Cargo target directory so they
   cannot leak into a Nerves target release through the application's `priv` directory.
+- Reserve finite lease capacity before the token-bearing issue commit, run backend release
+  callbacks on a monitored serial executor, normalize owner-death lifecycle calls, and keep
+  active-holder/oldest-lease statistics incremental.
+- Count dispatcher delivery to dead local owners separately from fatal worker/channel corruption.
+- Verify DMA-BUF allocation sizes against the fd, reject unreferenced descriptor objects, and bound
+  compute NV12 shader addressing to its logical 32-bit source span.
+- Bind Vulkan synchronization lanes to unique import identities, enforce renderer wait/release
+  ordering, route queue submission through renderer-owned authority, and quarantine uncertain drop.
+- Inventory and resolve multiple NV12 candidates per modifier, preserve forced fail-closed modes,
+  and cache direct NV12 imports alongside staged sources.
+- Add reproducible SPIR-V regeneration/validation and all-feature Vulkan CI coverage.

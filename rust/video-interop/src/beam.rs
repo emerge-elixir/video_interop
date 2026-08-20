@@ -98,17 +98,23 @@ pub struct ReleaseDispatcher {
     sender: Sender<WorkerCommand>,
     state: Mutex<DispatcherState>,
     health: Arc<AtomicU8>,
+    undelivered_commands: Arc<AtomicUsize>,
     active_clients: AtomicUsize,
 }
 
 #[derive(Clone)]
 pub struct DispatcherProbe {
     health: Arc<AtomicU8>,
+    undelivered_commands: Arc<AtomicUsize>,
 }
 
 impl DispatcherProbe {
     pub fn health(&self) -> DispatcherHealth {
         decode_health(self.health.load(Ordering::Acquire))
+    }
+
+    pub fn undelivered_commands(&self) -> usize {
+        self.undelivered_commands.load(Ordering::Acquire)
     }
 }
 
@@ -121,10 +127,12 @@ impl ReleaseDispatcher {
         let (sender, receiver) = channel();
         let health = Arc::new(AtomicU8::new(HEALTHY));
         let worker_health = Arc::clone(&health);
+        let undelivered_commands = Arc::new(AtomicUsize::new(0));
+        let worker_undelivered = Arc::clone(&undelivered_commands);
 
         let worker = thread::Builder::new()
             .name(name.into())
-            .spawn(move || dispatch_worker(receiver, worker_health))
+            .spawn(move || dispatch_worker(receiver, worker_health, worker_undelivered))
             .map_err(|error| DispatcherError::new(error.to_string()))?;
 
         Ok(ResourceArc::new(Self {
@@ -135,6 +143,7 @@ impl ReleaseDispatcher {
                 joining: false,
             }),
             health,
+            undelivered_commands,
             active_clients: AtomicUsize::new(0),
         }))
     }
@@ -152,6 +161,7 @@ impl ReleaseDispatcher {
     pub fn probe(&self) -> DispatcherProbe {
         DispatcherProbe {
             health: Arc::clone(&self.health),
+            undelivered_commands: Arc::clone(&self.undelivered_commands),
         }
     }
 
@@ -621,12 +631,20 @@ impl DispatchCommand {
     }
 }
 
-fn dispatch_worker(receiver: Receiver<WorkerCommand>, health: Arc<AtomicU8>) {
+fn dispatch_worker(
+    receiver: Receiver<WorkerCommand>,
+    health: Arc<AtomicU8>,
+    undelivered_commands: Arc<AtomicUsize>,
+) {
     let result = catch_unwind(AssertUnwindSafe(|| {
         loop {
             match receiver.recv() {
                 Ok(WorkerCommand::Dispatch(command)) => {
-                    let _ = command.send();
+                    if command.send().is_err() {
+                        // The local recipient exited. Its producer/owner-crash destructor is now
+                        // authoritative; the dispatcher worker and FIFO remain healthy.
+                        undelivered_commands.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 Ok(WorkerCommand::Stop) => break,
                 #[cfg(feature = "test-support")]

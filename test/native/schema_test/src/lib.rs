@@ -160,6 +160,11 @@ fn dispatcher_health(probe: ResourceArc<TestDispatcherProbe>) -> &'static str {
 }
 
 #[rustler::nif]
+fn dispatcher_undelivered_commands(probe: ResourceArc<TestDispatcherProbe>) -> usize {
+    probe.0.undelivered_commands()
+}
+
+#[rustler::nif]
 fn new_abandonment_guard_resource<'a>(
     dispatcher_owner: ResourceArc<DispatcherOwner>,
     owner: LocalPid,

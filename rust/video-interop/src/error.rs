@@ -37,6 +37,8 @@ pub enum ValidationError {
     NegativeFd { index: usize, fd: i32 },
     #[error("acquire fence has negative fd {0}")]
     NegativeAcquireFence(i32),
+    #[error("object {index} is not referenced by any descriptor plane")]
+    UnreferencedObject { index: usize },
     #[error("object {index} has zero size")]
     ZeroObjectSize { index: usize },
     #[error("layer {index} has invalid DRM fourcc 0")]

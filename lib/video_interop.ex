@@ -31,7 +31,7 @@ defmodule VideoInterop do
   `owner:` defaults to the caller and must be a local PID. Consumer
   implementations use it to close the stream if its logical owner dies.
   """
-  @spec open_consumer(Consumer.t(), Format.t(), keyword()) ::
+  @spec open_consumer(term(), Format.t(), keyword()) ::
           {:ok, ConsumerSession.t()} | {:error, term()}
   def open_consumer(consumer, %Format{} = format, opts \\ []) when is_list(opts) do
     owner = Keyword.get(opts, :owner, self())

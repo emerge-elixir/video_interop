@@ -35,7 +35,8 @@ defmodule VideoInterop.Validator do
          :ok <- bounded_nonempty_list(layers, @max_avdrm_entries, [:descriptor, :layers]),
          :ok <- validate_objects(objects),
          :ok <- validate_layers(layers, objects),
-         :ok <- validate_total_plane_count(layers) do
+         :ok <- validate_total_plane_count(layers),
+         :ok <- validate_referenced_objects(layers, objects) do
       :ok
     end
   end
@@ -326,6 +327,21 @@ defmodule VideoInterop.Validator do
 
   defp bounded_nonempty_list(value, _max, path),
     do: {:error, {:invalid_field, path, value}}
+
+  defp validate_referenced_objects(layers, objects) do
+    referenced =
+      layers
+      |> Enum.flat_map(& &1.planes)
+      |> Enum.map(& &1.object_index)
+      |> MapSet.new()
+
+    case objects
+         |> Enum.with_index()
+         |> Enum.find(fn {_object, index} -> not MapSet.member?(referenced, index) end) do
+      nil -> :ok
+      {_object, index} -> {:error, {:unreferenced_object, index}}
+    end
+  end
 
   defp validate_total_plane_count(layers) do
     count = Enum.reduce(layers, 0, fn layer, total -> total + length(layer.planes) end)

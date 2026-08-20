@@ -4,6 +4,9 @@
 //! capability queries, and acquire/release synchronization. A renderer supplies an already
 //! selected Vulkan device and may wrap [`ImportedDmaBufImage::image`] in its own rendering API.
 
+mod capability;
+mod error;
+mod identity;
 mod sync;
 
 use std::{
@@ -21,6 +24,14 @@ use crate::{
     ChromaLocation, ColorRange, Colorimetry, Matrix, Primaries, Transfer, duplicate_fd_cloexec,
 };
 
+pub use capability::{
+    inventory_nv12_modifier_capabilities,
+    inventory_nv12_modifier_capabilities_with_staging_preference,
+    validate_bgra_scanout_import_support, validate_packed_import_support,
+    validate_packed_staging_support, validate_rgba_import_support,
+};
+pub use error::VulkanImportError;
+use identity::verified_dmabuf_identity;
 pub use sync::{
     DMA_BUF_EXTERNAL_QUEUE_FAMILY, ImportedImageSync, ImportedImageSyncError,
     ImportedImageSyncErrorKind, VulkanVideoTiming, validate_sync_fd_import,
@@ -99,6 +110,7 @@ const DEFAULT_NV12_SOURCE_CACHE_ENTRIES: usize = 32;
 const DEFAULT_NV12_OUTPUT_SLOTS: usize = 8;
 const DEFAULT_PACKED_SOURCE_CACHE_ENTRIES: usize = 32;
 const DEFAULT_PACKED_OUTPUT_SLOTS: usize = 8;
+static NEXT_IMPORT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VulkanImportPoolLimits {
@@ -130,8 +142,42 @@ pub trait VulkanDeviceContext: Send + Sync + 'static {
     fn device(&self) -> &Device;
     fn queue(&self) -> vk::Queue;
     fn queue_family_index(&self) -> u32;
+
+    /// Submits through the renderer's single queue-host-access authority.
+    ///
+    /// Implementations must serialize this call with every other host access to the same queue,
+    /// including submissions performed by the renderer integration.
+    ///
+    /// # Safety
+    ///
+    /// Every handle and pointer reachable from `submits` must remain valid for the submission, and
+    /// `fence` must be idle and owned by the caller under normal Vulkan `vkQueueSubmit` rules.
+    unsafe fn submit_video_queue(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: vk::Fence,
+    ) -> Result<(), vk::Result>;
+
     fn mark_device_lost(&self);
     fn is_device_lost(&self) -> bool;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ImportId(u64);
+
+impl ImportId {
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+fn next_import_id() -> ImportId {
+    let id = NEXT_IMPORT_ID.fetch_add(1, Ordering::Relaxed);
+    if id == 0 {
+        ImportId(NEXT_IMPORT_ID.fetch_add(1, Ordering::Relaxed))
+    } else {
+        ImportId(id)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -450,6 +496,13 @@ fn nv12_transfer_source_span(
     Ok(luma_end.max(chroma_end))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Nv12ResolveRequest {
+    pub modifier: u64,
+    pub dimensions: (u32, u32),
+    pub conversion: Nv12Conversion,
+}
+
 #[derive(Clone, Copy)]
 pub struct Nv12ModifierCapability {
     pub modifier: u64,
@@ -467,6 +520,36 @@ pub struct Nv12ModifierCapability {
 impl Nv12ModifierCapability {
     pub fn allocation_recipe(self) -> Nv12AllocationBindingRecipe {
         self.strategy.allocation_recipe()
+    }
+}
+
+pub fn resolve_nv12_modifier_capability(
+    capabilities: &[Nv12ModifierCapability],
+    request: Nv12ResolveRequest,
+) -> Result<Nv12ModifierCapability, String> {
+    let mut rejections = Vec::new();
+    for capability in capabilities
+        .iter()
+        .copied()
+        .filter(|capability| capability.modifier == request.modifier)
+    {
+        match validate_nv12_modifier_capability(capability, request.dimensions, request.conversion)
+        {
+            Ok(()) => return Ok(capability),
+            Err(error) => rejections.push(format!("{:?}: {error}", capability.strategy)),
+        }
+    }
+    if rejections.is_empty() {
+        Err(format!(
+            "Vulkan NV12 modifier {:#018x} has no active-device import candidate",
+            request.modifier
+        ))
+    } else {
+        Err(format!(
+            "Vulkan NV12 modifier {:#018x} has no candidate satisfying this stream: {}",
+            request.modifier,
+            rejections.join("; ")
+        ))
     }
 }
 
@@ -591,6 +674,9 @@ struct Nv12SourceCacheKey {
 }
 
 enum CachedNv12SourceAllocation<D: VulkanDeviceContext> {
+    Direct {
+        sampled: ImageAllocation<D>,
+    },
     Compute {
         // The view must be destroyed before its buffer and imported memory.
         view: BufferViewAllocation<D>,
@@ -602,16 +688,17 @@ enum CachedNv12SourceAllocation<D: VulkanDeviceContext> {
 }
 
 impl<D: VulkanDeviceContext> CachedNv12SourceAllocation<D> {
-    fn source(&self) -> &BufferAllocation<D> {
+    fn source(&self) -> Option<&BufferAllocation<D>> {
         match self {
-            Self::Compute { source, .. } | Self::Transfer { source } => source,
+            Self::Compute { source, .. } | Self::Transfer { source } => Some(source),
+            Self::Direct { .. } => None,
         }
     }
 
     fn compute_view(&self) -> Option<vk::BufferView> {
         match self {
             Self::Compute { view, .. } => Some(view.view),
-            Self::Transfer { .. } => None,
+            Self::Direct { .. } | Self::Transfer { .. } => None,
         }
     }
 }
@@ -870,6 +957,7 @@ struct StagedNv12Import<D: VulkanDeviceContext> {
 pub struct VulkanDmaBufImporter<D: VulkanDeviceContext> {
     device: Arc<D>,
     nv12_capabilities: Vec<Nv12ModifierCapability>,
+    staging_preference: Nv12StagingPreference,
     // Pools must drop before the descriptor-set layouts owned by their pipelines.
     nv12_output_pool: Mutex<Nv12OutputPool<D>>,
     nv12_source_cache: Mutex<Nv12SourceCache<D>>,
@@ -961,6 +1049,7 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
         Ok(Self {
             device,
             nv12_capabilities,
+            staging_preference,
             nv12_output_pool: Mutex::new(Nv12OutputPool::new(limits.nv12_output_slots)),
             nv12_source_cache: Mutex::new(Nv12SourceCache::new(limits.nv12_source_cache_entries)),
             packed_output_pool: Mutex::new(PackedOutputPool::new(limits.packed_output_slots)),
@@ -995,6 +1084,30 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
 
     pub fn nv12_capabilities(&self) -> &[Nv12ModifierCapability] {
         &self.nv12_capabilities
+    }
+
+    pub fn resolve_nv12(
+        &self,
+        request: Nv12ResolveRequest,
+    ) -> Result<Nv12ModifierCapability, String> {
+        let capability = resolve_nv12_modifier_capability(&self.nv12_capabilities, request)?;
+        match self.staging_preference {
+            Nv12StagingPreference::PreferPlanar => Ok(capability),
+            Nv12StagingPreference::RequirePlanar
+                if capability.strategy == Nv12ImportStrategy::LinearBufferToYuvPlanes =>
+            {
+                Ok(capability)
+            }
+            Nv12StagingPreference::RequireRgba
+                if capability.strategy == Nv12ImportStrategy::LinearBufferToRgba =>
+            {
+                Ok(capability)
+            }
+            required => Err(format!(
+                "Vulkan NV12 candidate {:?} violates staging policy {required:?}",
+                capability.strategy
+            )),
+        }
     }
 
     pub fn packed_import_strategy(
@@ -1073,11 +1186,11 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
                     ) {
                         Ok(output) => output,
                         Err(error) => {
-                            if error.starts_with("Vulkan packed output pool is saturated") {
+                            if matches!(error, VulkanImportError::PoolSaturated { .. }) {
                                 self.packed_output_pool_busy_rejections
                                     .fetch_add(1, Ordering::Relaxed);
                             }
-                            return Err(error);
+                            return Err(error.to_string());
                         }
                     }
                 };
@@ -1159,11 +1272,11 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
         } = request;
         validate_image_inputs(dimensions, source_fd, plane)?;
         if let Err(error) = validate_packed_layout(dimensions, source_size, plane) {
-            if error.starts_with("DMA-BUF object size ") {
+            if error.is_allocation_size() {
                 self.packed_allocation_size_rejections
                     .fetch_add(1, Ordering::Relaxed);
             }
-            return Err(error);
+            return Err(error.to_string());
         }
         match strategy {
             PackedImageImportStrategy::DirectSampledImage => {
@@ -1179,7 +1292,17 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
                 }
             }
         }
-        let (device, inode) = dmabuf_identity(source_fd)?;
+        let identity = match verified_dmabuf_identity(source_fd, source_size) {
+            Ok(identity) => identity,
+            Err(error) => {
+                self.packed_allocation_size_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(error.to_string());
+            }
+        };
+        debug_assert_eq!(identity.allocation_size, source_size);
+        let device = identity.device;
+        let inode = identity.inode;
         let topology = PackedSourceTopology {
             dimensions,
             object_size: source_size,
@@ -1251,13 +1374,11 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
         let allocation = match allocation {
             Ok(allocation) => allocation,
             Err(error) => {
-                if error.starts_with("DMA-BUF object size ")
-                    || error.starts_with("DMA-BUF allocation size ")
-                {
+                if error.is_allocation_size() {
                     self.packed_allocation_size_rejections
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                return Err(error);
+                return Err(error.to_string());
             }
         };
         let source = Arc::new(CachedPackedSource {
@@ -1338,13 +1459,33 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
         validate_nv12_shared_layout(dimensions, layout)?;
         match capability.strategy {
             Nv12ImportStrategy::DirectSampledImage => {
-                ImportedDmaBufImage::new_nv12_direct_shared_object(
-                    Arc::clone(&self.device),
-                    dimensions,
+                let topology = layout.frame_topology(dimensions);
+                let source = self.claim_cached_source(
+                    stream_incarnation,
                     source_fd,
-                    layout,
-                    conversion,
-                    capability,
+                    topology,
+                    capability.strategy,
+                    || {
+                        let sampled = create_direct_image(
+                            Arc::clone(&self.device),
+                            dimensions,
+                            source_fd,
+                            layout.modifier,
+                            &layout.planes,
+                            IMPORTED_NV12_FORMAT,
+                            DIRECT_NV12_USAGE,
+                            Some(layout.object_size),
+                        )
+                        .map_err(|error| error.to_string())?;
+                        Ok(CachedNv12Source {
+                            allocation: CachedNv12SourceAllocation::Direct { sampled },
+                            claimed: AtomicBool::new(false),
+                            last_used: AtomicU64::new(0),
+                        })
+                    },
+                )?;
+                ImportedDmaBufImage::from_direct_nv12_source(
+                    dimensions, layout, conversion, capability, source,
                 )
             }
             Nv12ImportStrategy::LinearBufferToOptimalNv12
@@ -1448,10 +1589,14 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
         stream_incarnation: u64,
         source_fd: i32,
         topology: Nv12FrameTopology,
-        source_buffer_size: u64,
         strategy: Nv12ImportStrategy,
+        create: impl FnOnce() -> Result<CachedNv12Source<D>, String>,
     ) -> Result<Nv12SourceLease<D>, String> {
-        let (device_id, inode) = dmabuf_identity(source_fd)?;
+        let identity = verified_dmabuf_identity(source_fd, topology.object_size)
+            .map_err(|error| error.to_string())?;
+        debug_assert_eq!(identity.allocation_size, topology.object_size);
+        let device_id = identity.device;
+        let inode = identity.inode;
         let generation = self.source_cache_clock.fetch_add(1, Ordering::Relaxed);
         let key = Nv12SourceCacheKey {
             stream_incarnation,
@@ -1494,13 +1639,7 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
         }
 
         self.source_cache_misses.fetch_add(1, Ordering::Relaxed);
-        let source = Arc::new(create_cached_nv12_source(
-            Arc::clone(&self.device),
-            source_fd,
-            source_buffer_size,
-            topology.object_size,
-            strategy,
-        )?);
+        let source = Arc::new(create()?);
         let mut cache = self
             .nv12_source_cache
             .lock()
@@ -1566,7 +1705,7 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
             }
             Nv12ImportStrategy::LinearBufferToYuvPlanes
             | Nv12ImportStrategy::LinearBufferToRgba => {
-                validate_staged_layout(self.device.as_ref(), layout)?;
+                validate_staged_layout(self.device.as_ref(), dimensions, layout)?;
             }
             Nv12ImportStrategy::DirectSampledImage => {
                 return Err("direct NV12 import cannot use staged construction".to_string());
@@ -1580,15 +1719,18 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
         ) {
             nv12_transfer_source_span(dimensions, layout)?
         } else {
-            layout.object_size
+            nv12_compute_source_span(dimensions, layout)?
         };
-        let source = self.claim_cached_source(
-            stream_incarnation,
-            source_fd,
-            topology,
-            source_buffer_size,
-            strategy,
-        )?;
+        let source =
+            self.claim_cached_source(stream_incarnation, source_fd, topology, strategy, || {
+                create_cached_nv12_source(
+                    Arc::clone(&self.device),
+                    source_fd,
+                    source_buffer_size,
+                    topology.object_size,
+                    strategy,
+                )
+            })?;
         let source_view = source.source.allocation.compute_view();
         let output = {
             let mut pool = self
@@ -1604,11 +1746,11 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
             ) {
                 Ok(output) => output,
                 Err(error) => {
-                    if error.starts_with("Vulkan NV12 output pool is saturated") {
+                    if matches!(error, VulkanImportError::PoolSaturated { .. }) {
                         self.output_pool_busy_rejections
                             .fetch_add(1, Ordering::Relaxed);
                     }
-                    return Err(error);
+                    return Err(error.to_string());
                 }
             }
         };
@@ -1803,7 +1945,7 @@ impl<D: VulkanDeviceContext> Nv12OutputPool<D> {
         strategy: Nv12ImportStrategy,
         pipeline: Option<&Nv12ComputePipeline<D>>,
         source_view: Option<vk::BufferView>,
-    ) -> Result<Nv12OutputLease<D>, String> {
+    ) -> Result<Nv12OutputLease<D>, VulkanImportError> {
         if let Some(slot) = self.slots.iter().find(|slot| {
             slot.dimensions == dimensions
                 && slot.strategy == strategy
@@ -1817,7 +1959,8 @@ impl<D: VulkanDeviceContext> Nv12OutputPool<D> {
                 released: AtomicBool::new(false),
             };
             if let Some(source_view) = source_view {
-                update_staged_descriptor_set(device.as_ref(), slot, source_view)?;
+                update_staged_descriptor_set(device.as_ref(), slot, source_view)
+                    .map_err(VulkanImportError::Other)?;
             }
             return Ok(lease);
         }
@@ -1828,19 +1971,16 @@ impl<D: VulkanDeviceContext> Nv12OutputPool<D> {
             }) {
                 self.slots.swap_remove(idle);
             } else {
-                return Err(format!(
-                    "Vulkan NV12 output pool is saturated at {} slots",
-                    self.max_slots
-                ));
+                return Err(VulkanImportError::PoolSaturated {
+                    pool: "NV12 output",
+                    limit: self.max_slots,
+                });
             }
         }
-        let slot = Arc::new(create_staged_output_slot(
-            device,
-            dimensions,
-            strategy,
-            pipeline,
-            source_view,
-        )?);
+        let slot = Arc::new(
+            create_staged_output_slot(device, dimensions, strategy, pipeline, source_view)
+                .map_err(VulkanImportError::Other)?,
+        );
         slot.claimed.store(true, Ordering::Release);
         self.slots.push(Arc::clone(&slot));
         Ok(Nv12OutputLease {
@@ -1911,7 +2051,7 @@ impl<D: VulkanDeviceContext> PackedOutputPool<D> {
         dimensions: (u32, u32),
         pipeline: &PackedComputePipeline<D>,
         source_view: vk::BufferView,
-    ) -> Result<PackedOutputLease<D>, String> {
+    ) -> Result<PackedOutputLease<D>, VulkanImportError> {
         if let Some(slot) = self.slots.iter().find(|slot| {
             slot.dimensions == dimensions
                 && slot
@@ -1931,18 +2071,16 @@ impl<D: VulkanDeviceContext> PackedOutputPool<D> {
             }) {
                 self.slots.swap_remove(idle);
             } else {
-                return Err(format!(
-                    "Vulkan packed output pool is saturated at {} slots",
-                    self.max_slots
-                ));
+                return Err(VulkanImportError::PoolSaturated {
+                    pool: "packed output",
+                    limit: self.max_slots,
+                });
             }
         }
-        let slot = Arc::new(create_packed_output_slot(
-            device,
-            dimensions,
-            pipeline,
-            source_view,
-        )?);
+        let slot = Arc::new(
+            create_packed_output_slot(device, dimensions, pipeline, source_view)
+                .map_err(VulkanImportError::Other)?,
+        );
         slot.claimed.store(true, Ordering::Release);
         self.slots.push(Arc::clone(&slot));
         Ok(PackedOutputLease {
@@ -2000,7 +2138,7 @@ struct StagedNv12<D: VulkanDeviceContext> {
 enum ImportedKind<D: VulkanDeviceContext> {
     DirectPacked(PackedSourceLease<D>),
     DirectBgraScanout(ImageAllocation<D>),
-    DirectNv12(ImageAllocation<D>, DirectNv12Sampling),
+    DirectNv12(Nv12SourceLease<D>, DirectNv12Sampling),
     StagedPacked(StagedPacked<D>),
     StagedNv12(StagedNv12<D>),
 }
@@ -2008,6 +2146,7 @@ enum ImportedKind<D: VulkanDeviceContext> {
 /// One renderer-ready import. Direct imports alias producer memory; staged imports retain a
 /// persistent cached source claim and one bounded renderer-native output slot.
 pub struct ImportedDmaBufImage<D: VulkanDeviceContext> {
+    id: ImportId,
     kind: ImportedKind<D>,
     dimensions: (u32, u32),
     modifier: u64,
@@ -2016,6 +2155,10 @@ pub struct ImportedDmaBufImage<D: VulkanDeviceContext> {
 }
 
 impl<D: VulkanDeviceContext> ImportedDmaBufImage<D> {
+    pub fn import_id(&self) -> ImportId {
+        self.id
+    }
+
     pub fn new_bgra_scanout(
         device: Arc<D>,
         dimensions: (u32, u32),
@@ -2030,6 +2173,7 @@ impl<D: VulkanDeviceContext> ImportedDmaBufImage<D> {
             return Err("Vulkan scanout import has a zero allocation size".to_string());
         }
         validate_bgra_scanout_import_support(device.as_ref(), modifier, usage)?;
+        verified_dmabuf_identity(source_fd, source_size).map_err(|error| error.to_string())?;
         let sampled = create_direct_image(
             Arc::clone(&device),
             dimensions,
@@ -2039,8 +2183,10 @@ impl<D: VulkanDeviceContext> ImportedDmaBufImage<D> {
             IMPORTED_SCANOUT_BGRA_FORMAT,
             usage,
             Some(source_size),
-        )?;
+        )
+        .map_err(|error| error.to_string())?;
         Ok(Self {
+            id: next_import_id(),
             kind: ImportedKind::DirectBgraScanout(sampled),
             dimensions,
             modifier,
@@ -2060,6 +2206,7 @@ impl<D: VulkanDeviceContext> ImportedDmaBufImage<D> {
             );
         }
         Ok(Self {
+            id: next_import_id(),
             kind: ImportedKind::DirectPacked(source),
             dimensions,
             modifier,
@@ -2068,38 +2215,23 @@ impl<D: VulkanDeviceContext> ImportedDmaBufImage<D> {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn new_nv12_direct_shared_object(
-        device: Arc<D>,
+    fn from_direct_nv12_source(
         dimensions: (u32, u32),
-        source_fd: i32,
         layout: Nv12SharedObjectLayout,
         conversion: Nv12Conversion,
         capability: Nv12ModifierCapability,
+        source: Nv12SourceLease<D>,
     ) -> Result<Self, String> {
-        if source_fd < 0 {
-            return Err("Vulkan NV12 import has an invalid DMA-BUF fd".to_string());
+        if !matches!(
+            &source.source.allocation,
+            CachedNv12SourceAllocation::Direct { .. }
+        ) {
+            return Err("Vulkan direct NV12 import received a staged cache entry".to_string());
         }
-        if capability.modifier != layout.modifier {
-            return Err("Vulkan NV12 capability modifier does not match frame layout".to_string());
-        }
-        validate_nv12_modifier_capability(capability, dimensions, conversion)?;
-        if capability.strategy != Nv12ImportStrategy::DirectSampledImage {
-            return Err("Vulkan NV12 direct constructor received a staged capability".to_string());
-        }
-        let sampled = create_direct_image(
-            Arc::clone(&device),
-            dimensions,
-            source_fd,
-            layout.modifier,
-            &layout.planes,
-            IMPORTED_NV12_FORMAT,
-            DIRECT_NV12_USAGE,
-            Some(layout.object_size),
-        )?;
         Ok(Self {
+            id: next_import_id(),
             kind: ImportedKind::DirectNv12(
-                sampled,
+                source,
                 DirectNv12Sampling {
                     conversion,
                     format_features: capability.sampled_tiling_features,
@@ -2120,9 +2252,14 @@ impl<D: VulkanDeviceContext> ImportedDmaBufImage<D> {
                     unreachable!("direct packed import owns a direct image")
                 }
             },
-            ImportedKind::DirectBgraScanout(sampled) | ImportedKind::DirectNv12(sampled, _) => {
-                sampled.image
-            }
+            ImportedKind::DirectBgraScanout(sampled) => sampled.image,
+            ImportedKind::DirectNv12(source, _) => match &source.source.allocation {
+                CachedNv12SourceAllocation::Direct { sampled } => sampled.image,
+                CachedNv12SourceAllocation::Compute { .. }
+                | CachedNv12SourceAllocation::Transfer { .. } => {
+                    unreachable!("direct NV12 import owns a direct cached image")
+                }
+            },
             ImportedKind::StagedPacked(staged) => staged.output.slot.sampled.image,
             ImportedKind::StagedNv12(staged) => match staged.output.slot.sampled_images() {
                 StagedSampledImages::Rgba { image } | StagedSampledImages::Nv12 { image } => image,
@@ -2142,9 +2279,14 @@ impl<D: VulkanDeviceContext> ImportedDmaBufImage<D> {
                     unreachable!("direct packed import owns a direct image")
                 }
             },
-            ImportedKind::DirectBgraScanout(sampled) | ImportedKind::DirectNv12(sampled, _) => {
-                sampled.device.as_ref()
-            }
+            ImportedKind::DirectBgraScanout(sampled) => sampled.device.as_ref(),
+            ImportedKind::DirectNv12(source, _) => match &source.source.allocation {
+                CachedNv12SourceAllocation::Direct { sampled } => sampled.device.as_ref(),
+                CachedNv12SourceAllocation::Compute { .. }
+                | CachedNv12SourceAllocation::Transfer { .. } => {
+                    unreachable!("direct NV12 import owns a direct cached image")
+                }
+            },
             ImportedKind::StagedPacked(staged) => staged.output.slot.device.as_ref(),
             ImportedKind::StagedNv12(staged) => staged.output.slot.device.as_ref(),
         }
@@ -2288,7 +2430,12 @@ impl<D: VulkanDeviceContext> ImportedDmaBufImage<D> {
                 })
             }
             ImportedKind::StagedNv12(staged) => {
-                let source = staged.source.source.allocation.source();
+                let source = staged
+                    .source
+                    .source
+                    .allocation
+                    .source()
+                    .expect("staged NV12 import owns a source buffer");
                 match &staged.operation {
                     StagedNv12Operation::Compute {
                         pipeline,
@@ -2335,11 +2482,18 @@ impl<D: VulkanDeviceContext> ImportedDmaBufImage<D> {
                     unreachable!("direct packed import owns a direct image")
                 }
             },
-            ImportedKind::DirectBgraScanout(sampled) | ImportedKind::DirectNv12(sampled, _) => {
-                AcquirePlan::DirectImage {
+            ImportedKind::DirectBgraScanout(sampled) => AcquirePlan::DirectImage {
+                image: sampled.image,
+            },
+            ImportedKind::DirectNv12(source, _) => match &source.source.allocation {
+                CachedNv12SourceAllocation::Direct { sampled } => AcquirePlan::DirectImage {
                     image: sampled.image,
+                },
+                CachedNv12SourceAllocation::Compute { .. }
+                | CachedNv12SourceAllocation::Transfer { .. } => {
+                    unreachable!("direct NV12 import owns a direct cached image")
                 }
-            }
+            },
         }
     }
 }
@@ -2762,22 +2916,43 @@ fn shader_words(output: Nv12ComputeOutput) -> Result<Vec<u32>, String> {
         .collect())
 }
 
+fn nv12_compute_source_span(
+    dimensions: (u32, u32),
+    layout: Nv12SharedObjectLayout,
+) -> Result<u64, String> {
+    validate_nv12_shared_layout(dimensions, layout)?;
+    let (luma_end, chroma_end) = nv12_plane_ends(dimensions, layout)?;
+    luma_end
+        .max(chroma_end)
+        .checked_add(3)
+        .map(|span| span & !3)
+        .ok_or_else(|| "Vulkan staged NV12 source span alignment overflow".to_string())
+}
+
 fn validate_staged_layout<D: VulkanDeviceContext>(
     device: &D,
+    dimensions: (u32, u32),
     layout: Nv12SharedObjectLayout,
 ) -> Result<(), String> {
-    if !layout.object_size.is_multiple_of(4) {
+    let source_span = nv12_compute_source_span(dimensions, layout)?;
+    if source_span > u64::from(u32::MAX) + 1 {
         return Err(
-            "Vulkan staged NV12 allocation size must be four-byte aligned for shader access"
+            "Vulkan staged NV12 source span exceeds the shader's 32-bit byte-address range"
                 .to_string(),
         );
+    }
+    if source_span > layout.object_size {
+        return Err(format!(
+            "Vulkan staged NV12 source span {source_span} exceeds allocation size {}",
+            layout.object_size
+        ));
     }
     let properties = unsafe {
         device
             .instance()
             .get_physical_device_properties(device.physical_device())
     };
-    let source_texel_count = layout.object_size / 4;
+    let source_texel_count = source_span / 4;
     if source_texel_count > u64::from(properties.limits.max_texel_buffer_elements) {
         return Err(format!(
             "Vulkan staged NV12 allocation requires {source_texel_count} R32 texels, exceeding maxTexelBufferElements {}",
@@ -2841,23 +3016,6 @@ fn validate_staged_packed_layout<D: VulkanDeviceContext>(
     Ok(())
 }
 
-fn dmabuf_identity(source_fd: i32) -> Result<(u64, u64), String> {
-    if source_fd < 0 {
-        return Err("Vulkan DMA-BUF identity requires a valid fd".to_string());
-    }
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
-    // SAFETY: `stat` points to writable storage and `source_fd` remains borrowed by the caller.
-    if unsafe { libc::fstat(source_fd, stat.as_mut_ptr()) } != 0 {
-        return Err(format!(
-            "failed to stat Vulkan DMA-BUF source fd: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: fstat initialized the complete structure after returning success.
-    let stat = unsafe { stat.assume_init() };
-    Ok((stat.st_dev, stat.st_ino))
-}
-
 fn create_cached_nv12_source<D: VulkanDeviceContext>(
     device: Arc<D>,
     source_fd: i32,
@@ -2875,21 +3033,24 @@ fn create_cached_nv12_source<D: VulkanDeviceContext>(
                     source_buffer_size,
                     source_allocation_size,
                     TRANSFER_NV12_SOURCE_USAGE,
-                )?,
+                )
+                .map_err(|error| error.to_string())?,
             }
         }
         Nv12ImportStrategy::LinearBufferToYuvPlanes | Nv12ImportStrategy::LinearBufferToRgba => {
-            let source = create_imported_buffer(
+            let source = create_imported_buffer_with_allocation_size(
                 Arc::clone(&device),
                 source_fd,
+                source_buffer_size,
                 source_allocation_size,
                 STAGED_NV12_SOURCE_USAGE,
-            )?;
+            )
+            .map_err(|error| error.to_string())?;
             let source_view_info = vk::BufferViewCreateInfo::default()
                 .buffer(source.buffer)
                 .format(STAGED_NV12_SOURCE_TEXEL_FORMAT)
                 .offset(0)
-                .range(source_allocation_size);
+                .range(source_buffer_size);
             let view = BufferViewAllocation {
                 device: Arc::clone(&device),
                 view: unsafe { device.device().create_buffer_view(&source_view_info, None) }
@@ -2914,7 +3075,7 @@ fn create_cached_packed_staged_source<D: VulkanDeviceContext>(
     device: Arc<D>,
     source_fd: i32,
     source_size: u64,
-) -> Result<PackedSourceAllocation<D>, String> {
+) -> Result<PackedSourceAllocation<D>, VulkanImportError> {
     let source = create_imported_buffer(
         Arc::clone(&device),
         source_fd,
@@ -2928,8 +3089,13 @@ fn create_cached_packed_staged_source<D: VulkanDeviceContext>(
         .range(source_size);
     let view = BufferViewAllocation {
         device: Arc::clone(&device),
-        view: unsafe { device.device().create_buffer_view(&source_view_info, None) }
-            .map_err(|result| format!("failed to create staged packed source view: {result:?}"))?,
+        view: unsafe { device.device().create_buffer_view(&source_view_info, None) }.map_err(
+            |result| {
+                VulkanImportError::Other(format!(
+                    "failed to create staged packed source view: {result:?}"
+                ))
+            },
+        )?,
     };
     Ok(PackedSourceAllocation::Staged { view, source })
 }
@@ -3301,6 +3467,7 @@ fn create_staged_packed<D: VulkanDeviceContext>(
         },
     };
     Ok(ImportedDmaBufImage {
+        id: next_import_id(),
         kind: ImportedKind::StagedPacked(StagedPacked {
             source,
             output,
@@ -3377,6 +3544,7 @@ fn create_staged_nv12<D: VulkanDeviceContext>(
         STAGED_NV12_OUTPUT_USAGE
     };
     Ok(ImportedDmaBufImage {
+        id: next_import_id(),
         kind: ImportedKind::StagedNv12(StagedNv12 {
             source,
             output,
@@ -3395,32 +3563,38 @@ fn validate_packed_layout(
     dimensions: (u32, u32),
     source_size: u64,
     plane: ImportedPlane,
-) -> Result<(), String> {
+) -> Result<(), VulkanImportError> {
     if source_size == 0 {
-        return Err("Vulkan packed import has a zero allocation size".to_string());
+        return Err(VulkanImportError::AllocationSize(
+            "Vulkan packed import has a zero allocation size".to_string(),
+        ));
     }
     let row_bytes = u64::from(dimensions.0)
         .checked_mul(4)
-        .ok_or_else(|| "Vulkan packed row size overflow".to_string())?;
+        .ok_or_else(|| VulkanImportError::Other("Vulkan packed row size overflow".to_string()))?;
     if u64::from(plane.pitch) < row_bytes {
-        return Err(format!(
+        return Err(VulkanImportError::Other(format!(
             "Vulkan packed image pitch {} is smaller than row size {row_bytes}",
             plane.pitch
-        ));
+        )));
     }
     let required = plane
         .offset
         .checked_add(
             u64::from(plane.pitch)
                 .checked_mul(u64::from(dimensions.1.saturating_sub(1)))
-                .ok_or_else(|| "Vulkan packed image extent overflow".to_string())?,
+                .ok_or_else(|| {
+                    VulkanImportError::Other("Vulkan packed image extent overflow".to_string())
+                })?,
         )
         .and_then(|last_row| last_row.checked_add(row_bytes))
-        .ok_or_else(|| "Vulkan packed image extent overflow".to_string())?;
+        .ok_or_else(|| {
+            VulkanImportError::Other("Vulkan packed image extent overflow".to_string())
+        })?;
     if required > source_size {
-        return Err(format!(
+        return Err(VulkanImportError::AllocationSize(format!(
             "DMA-BUF object size {source_size} is smaller than packed image span {required}"
-        ));
+        )));
     }
     Ok(())
 }
@@ -3452,7 +3626,7 @@ fn create_direct_image<D: VulkanDeviceContext>(
     format: vk::Format,
     usage: vk::ImageUsageFlags,
     source_size: Option<u64>,
-) -> Result<ImageAllocation<D>, String> {
+) -> Result<ImageAllocation<D>, VulkanImportError> {
     let plane_layouts = planes
         .iter()
         .map(|plane| {
@@ -3483,8 +3657,11 @@ fn create_direct_image<D: VulkanDeviceContext>(
         .initial_layout(vk::ImageLayout::UNDEFINED)
         .push_next(&mut modifier_info)
         .push_next(&mut external_info);
-    let image = unsafe { device.device().create_image(&create_info, None) }
-        .map_err(|result| format!("failed to create Vulkan DMA-BUF import image: {result:?}"))?;
+    let image = unsafe { device.device().create_image(&create_info, None) }.map_err(|result| {
+        VulkanImportError::Other(format!(
+            "failed to create Vulkan DMA-BUF import image: {result:?}"
+        ))
+    })?;
     match import_image_memory(Arc::clone(&device), image, source_fd, source_size) {
         Ok(memory) => Ok(ImageAllocation {
             device,
@@ -3503,7 +3680,7 @@ fn import_image_memory<D: VulkanDeviceContext>(
     image: vk::Image,
     source_fd: i32,
     source_size: Option<u64>,
-) -> Result<vk::DeviceMemory, String> {
+) -> Result<vk::DeviceMemory, VulkanImportError> {
     let requirements_info = vk::ImageMemoryRequirementsInfo2::default().image(image);
     let mut dedicated_requirements = vk::MemoryDedicatedRequirements::default();
     let mut requirements =
@@ -3514,18 +3691,19 @@ fn import_image_memory<D: VulkanDeviceContext>(
             .get_image_memory_requirements2(&requirements_info, &mut requirements)
     };
     if source_size.is_some_and(|size| size < requirements.memory_requirements.size) {
-        return Err(format!(
+        return Err(VulkanImportError::AllocationSize(format!(
             "DMA-BUF object size {} is smaller than Vulkan import requirement {}",
             source_size.unwrap_or(0),
             requirements.memory_requirements.size
-        ));
+        )));
     }
     let memory_type_index = imported_memory_type(
         device.as_ref(),
         source_fd,
         requirements.memory_requirements.memory_type_bits,
-    )?;
-    let duplicate = duplicate_import_fd(source_fd)?;
+    )
+    .map_err(VulkanImportError::Other)?;
+    let duplicate = duplicate_import_fd(source_fd).map_err(VulkanImportError::Other)?;
     let raw_duplicate = duplicate.into_raw_fd();
     let mut import_info = vk::ImportMemoryFdInfoKHR::default()
         .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
@@ -3540,9 +3718,9 @@ fn import_image_memory<D: VulkanDeviceContext>(
         Ok(memory) => memory,
         Err(result) => {
             close_unconsumed_fd(raw_duplicate);
-            return Err(format!(
+            return Err(VulkanImportError::Other(format!(
                 "failed to import Vulkan DMA-BUF image memory: {result:?}"
-            ));
+            )));
         }
     };
     let bind = vk::BindImageMemoryInfo::default()
@@ -3551,9 +3729,9 @@ fn import_image_memory<D: VulkanDeviceContext>(
         .memory_offset(0);
     if let Err(result) = unsafe { device.device().bind_image_memory2(&[bind]) } {
         unsafe { device.device().free_memory(memory, None) };
-        return Err(format!(
+        return Err(VulkanImportError::Other(format!(
             "failed to bind imported Vulkan DMA-BUF image memory: {result:?}"
-        ));
+        )));
     }
     Ok(memory)
 }
@@ -3563,7 +3741,7 @@ fn create_imported_buffer<D: VulkanDeviceContext>(
     source_fd: i32,
     source_size: u64,
     usage: vk::BufferUsageFlags,
-) -> Result<BufferAllocation<D>, String> {
+) -> Result<BufferAllocation<D>, VulkanImportError> {
     create_imported_buffer_with_allocation_size(device, source_fd, source_size, source_size, usage)
 }
 
@@ -3573,14 +3751,16 @@ fn create_imported_buffer_with_allocation_size<D: VulkanDeviceContext>(
     buffer_size: u64,
     allocation_size: u64,
     usage: vk::BufferUsageFlags,
-) -> Result<BufferAllocation<D>, String> {
+) -> Result<BufferAllocation<D>, VulkanImportError> {
     if source_fd < 0 || buffer_size == 0 || allocation_size == 0 {
-        return Err("Vulkan DMA-BUF buffer import requires a valid fd and size".to_string());
+        return Err(VulkanImportError::AllocationSize(
+            "Vulkan DMA-BUF buffer import requires a valid fd and size".to_string(),
+        ));
     }
     if buffer_size > allocation_size {
-        return Err(format!(
+        return Err(VulkanImportError::AllocationSize(format!(
             "Vulkan DMA-BUF source-buffer span {buffer_size} exceeds allocation size {allocation_size}"
-        ));
+        )));
     }
     let mut external = vk::ExternalMemoryBufferCreateInfo::default()
         .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
@@ -3589,29 +3769,32 @@ fn create_imported_buffer_with_allocation_size<D: VulkanDeviceContext>(
         .usage(usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .push_next(&mut external);
-    let buffer = unsafe { device.device().create_buffer(&info, None) }
-        .map_err(|result| format!("failed to create Vulkan DMA-BUF source buffer: {result:?}"))?;
+    let buffer = unsafe { device.device().create_buffer(&info, None) }.map_err(|result| {
+        VulkanImportError::Other(format!(
+            "failed to create Vulkan DMA-BUF source buffer: {result:?}"
+        ))
+    })?;
     let requirements = unsafe { device.device().get_buffer_memory_requirements(buffer) };
     if requirements.size > allocation_size {
         unsafe { device.device().destroy_buffer(buffer, None) };
-        return Err(format!(
+        return Err(VulkanImportError::AllocationSize(format!(
             "DMA-BUF allocation size {allocation_size} is smaller than Vulkan source-buffer requirement {} for copy span {buffer_size}",
             requirements.size
-        ));
+        )));
     }
     let memory_type_index =
         match imported_memory_type(device.as_ref(), source_fd, requirements.memory_type_bits) {
             Ok(index) => index,
             Err(error) => {
                 unsafe { device.device().destroy_buffer(buffer, None) };
-                return Err(error);
+                return Err(VulkanImportError::Other(error));
             }
         };
     let duplicate = match duplicate_import_fd(source_fd) {
         Ok(duplicate) => duplicate,
         Err(error) => {
             unsafe { device.device().destroy_buffer(buffer, None) };
-            return Err(error);
+            return Err(VulkanImportError::Other(error));
         }
     };
     let raw_duplicate = duplicate.into_raw_fd();
@@ -3629,9 +3812,9 @@ fn create_imported_buffer_with_allocation_size<D: VulkanDeviceContext>(
         Err(result) => {
             close_unconsumed_fd(raw_duplicate);
             unsafe { device.device().destroy_buffer(buffer, None) };
-            return Err(format!(
+            return Err(VulkanImportError::Other(format!(
                 "failed to import Vulkan DMA-BUF source memory: {result:?}"
-            ));
+            )));
         }
     };
     if let Err(result) = unsafe { device.device().bind_buffer_memory(buffer, memory, 0) } {
@@ -3639,9 +3822,9 @@ fn create_imported_buffer_with_allocation_size<D: VulkanDeviceContext>(
             device.device().free_memory(memory, None);
             device.device().destroy_buffer(buffer, None);
         }
-        return Err(format!(
+        return Err(VulkanImportError::Other(format!(
             "failed to bind imported Vulkan DMA-BUF source memory: {result:?}"
-        ));
+        )));
     }
     Ok(BufferAllocation {
         device,
@@ -3776,1184 +3959,5 @@ fn select_memory_type<D: VulkanDeviceContext>(device: &D, bits: u32) -> Result<u
         .ok_or_else(|| "imported Vulkan DMA-BUF has no compatible memory type".to_string())
 }
 
-pub fn validate_bgra_scanout_import_support<D: VulkanDeviceContext>(
-    device: &D,
-    modifier: u64,
-    usage: vk::ImageUsageFlags,
-) -> Result<(), String> {
-    validate_direct_modifier(
-        device,
-        IMPORTED_SCANOUT_BGRA_FORMAT,
-        modifier,
-        usage,
-        vk::FormatFeatureFlags::COLOR_ATTACHMENT
-            | vk::FormatFeatureFlags::TRANSFER_SRC
-            | vk::FormatFeatureFlags::TRANSFER_DST,
-        "B8G8R8A8",
-    )
-}
-
-pub fn validate_packed_import_support<D: VulkanDeviceContext>(
-    device: &D,
-    format: PackedImageFormat,
-    modifier: u64,
-) -> Result<(), String> {
-    validate_direct_modifier(
-        device,
-        format.vk_format(),
-        modifier,
-        DIRECT_PACKED_USAGE,
-        vk::FormatFeatureFlags::SAMPLED_IMAGE
-            | vk::FormatFeatureFlags::TRANSFER_SRC
-            | vk::FormatFeatureFlags::TRANSFER_DST
-            | vk::FormatFeatureFlags::COLOR_ATTACHMENT,
-        format.label(),
-    )
-}
-
-pub fn validate_packed_staging_support<D: VulkanDeviceContext>(
-    device: &D,
-    format: PackedImageFormat,
-    modifier: u64,
-) -> Result<(), String> {
-    if modifier != DRM_FORMAT_MOD_LINEAR {
-        return Err(format!(
-            "Vulkan packed buffer staging requires linear modifier 0, got {modifier:#018x}"
-        ));
-    }
-    if !selected_queue_supports_compute(device) {
-        return Err("selected Vulkan queue does not support packed compute staging".to_string());
-    }
-    let external_info = vk::PhysicalDeviceExternalBufferInfo::default()
-        .flags(vk::BufferCreateFlags::empty())
-        .usage(STAGED_PACKED_SOURCE_USAGE)
-        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-    let mut external = vk::ExternalBufferProperties::default();
-    unsafe {
-        device
-            .instance()
-            .get_physical_device_external_buffer_properties(
-                device.physical_device(),
-                &external_info,
-                &mut external,
-            )
-    };
-    let external = external.external_memory_properties;
-    validate_external_import(
-        external.external_memory_features,
-        external.compatible_handle_types,
-        &format!("linear {} source buffer", format.label()),
-    )?;
-
-    let mut source_properties = vk::FormatProperties2::default();
-    unsafe {
-        device.instance().get_physical_device_format_properties2(
-            device.physical_device(),
-            STAGED_PACKED_SOURCE_TEXEL_FORMAT,
-            &mut source_properties,
-        )
-    };
-    if !source_properties
-        .format_properties
-        .buffer_features
-        .contains(vk::FormatFeatureFlags::UNIFORM_TEXEL_BUFFER)
-    {
-        return Err("Vulkan R32_UINT packed source lacks uniform-texel-buffer support".to_string());
-    }
-
-    let output_required = vk::FormatFeatureFlags::SAMPLED_IMAGE
-        | vk::FormatFeatureFlags::STORAGE_IMAGE
-        | vk::FormatFeatureFlags::TRANSFER_SRC
-        | vk::FormatFeatureFlags::TRANSFER_DST;
-    let (_output_features, _max_extent) = query_optimal_staging_format_with_usage(
-        device,
-        IMPORTED_SCANOUT_BGRA_FORMAT,
-        output_required,
-        STAGED_PACKED_OUTPUT_USAGE,
-        vk::ImageCreateFlags::MUTABLE_FORMAT,
-    )?;
-    let mut storage_properties = vk::FormatProperties2::default();
-    unsafe {
-        device.instance().get_physical_device_format_properties2(
-            device.physical_device(),
-            STAGED_PACKED_STORAGE_VIEW_FORMAT,
-            &mut storage_properties,
-        )
-    };
-    if !storage_properties
-        .format_properties
-        .optimal_tiling_features
-        .contains(vk::FormatFeatureFlags::STORAGE_IMAGE)
-    {
-        return Err("Vulkan R32_UINT packed output view lacks storage-image support".to_string());
-    }
-    Ok(())
-}
-
-pub fn validate_rgba_import_support<D: VulkanDeviceContext>(
-    device: &D,
-    modifier: u64,
-) -> Result<(), String> {
-    validate_packed_import_support(device, PackedImageFormat::Rgba8888, modifier)
-}
-
-fn validate_direct_modifier<D: VulkanDeviceContext>(
-    device: &D,
-    format: vk::Format,
-    modifier: u64,
-    usage: vk::ImageUsageFlags,
-    required: vk::FormatFeatureFlags,
-    label: &str,
-) -> Result<(), String> {
-    let modifiers = format_modifiers(device, format)?;
-    if !modifiers.iter().any(|candidate| {
-        candidate.drm_format_modifier == modifier
-            && candidate.drm_format_modifier_plane_count == 1
-            && candidate
-                .drm_format_modifier_tiling_features
-                .contains(required)
-    }) {
-        return Err(format!(
-            "Vulkan device cannot use one-plane {label} DMA-BUF modifier {modifier:#018x}"
-        ));
-    }
-    let external = query_external_modifier_capability(device, format, modifier, usage)?;
-    validate_external_import(
-        external.external_features,
-        external.compatible_handle_types,
-        label,
-    )
-}
-
-pub fn inventory_nv12_modifier_capabilities<D: VulkanDeviceContext>(
-    device: &D,
-) -> Result<Vec<Nv12ModifierCapability>, String> {
-    inventory_nv12_modifier_capabilities_with_staging_preference(
-        device,
-        Nv12StagingPreference::default(),
-    )
-}
-
-pub fn inventory_nv12_modifier_capabilities_with_staging_preference<D: VulkanDeviceContext>(
-    device: &D,
-    staging_preference: Nv12StagingPreference,
-) -> Result<Vec<Nv12ModifierCapability>, String> {
-    let modifiers = format_modifiers(device, IMPORTED_NV12_FORMAT)?;
-    let direct = modifiers.iter().filter_map(|modifier| {
-        query_external_modifier_capability(
-            device,
-            IMPORTED_NV12_FORMAT,
-            modifier.drm_format_modifier,
-            DIRECT_NV12_USAGE,
-        )
-        .ok()
-        .filter(|external| {
-            modifier.drm_format_modifier_plane_count == 2
-                && external
-                    .external_features
-                    .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
-                && external
-                    .compatible_handle_types
-                    .contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-        })
-        .map(|external| Nv12ModifierCapability {
-            modifier: modifier.drm_format_modifier,
-            strategy: Nv12ImportStrategy::DirectSampledImage,
-            modifier_plane_count: modifier.drm_format_modifier_plane_count,
-            source_tiling_features: modifier.drm_format_modifier_tiling_features,
-            sampled_tiling_features: modifier.drm_format_modifier_tiling_features,
-            external_features: external.external_features,
-            compatible_handle_types: external.compatible_handle_types,
-            max_extent: external.max_extent,
-        })
-    });
-    let mut capabilities = direct.collect::<Vec<_>>();
-    if !capabilities
-        .iter()
-        .any(|capability| capability.modifier == DRM_FORMAT_MOD_LINEAR)
-        && let Some(linear) = modifiers
-            .iter()
-            .find(|modifier| modifier.drm_format_modifier == DRM_FORMAT_MOD_LINEAR)
-        && let Ok(staged) =
-            query_linear_nv12_staging_capability(device, *linear, staging_preference)
-    {
-        capabilities.push(staged);
-    }
-    Ok(capabilities)
-}
-
-fn selected_queue_flags<D: VulkanDeviceContext>(device: &D) -> vk::QueueFlags {
-    unsafe {
-        device
-            .instance()
-            .get_physical_device_queue_family_properties(device.physical_device())
-    }
-    .get(usize::try_from(device.queue_family_index()).unwrap_or(usize::MAX))
-    .filter(|properties| properties.queue_count > 0)
-    .map(|properties| properties.queue_flags)
-    .unwrap_or_default()
-}
-
-fn selected_queue_supports_compute<D: VulkanDeviceContext>(device: &D) -> bool {
-    selected_queue_flags(device).contains(vk::QueueFlags::COMPUTE)
-}
-
-fn query_external_buffer_properties<D: VulkanDeviceContext>(
-    device: &D,
-    usage: vk::BufferUsageFlags,
-    label: &str,
-) -> Result<vk::ExternalMemoryProperties, String> {
-    let external_info = vk::PhysicalDeviceExternalBufferInfo::default()
-        .flags(vk::BufferCreateFlags::empty())
-        .usage(usage)
-        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-    let mut external = vk::ExternalBufferProperties::default();
-    unsafe {
-        device
-            .instance()
-            .get_physical_device_external_buffer_properties(
-                device.physical_device(),
-                &external_info,
-                &mut external,
-            )
-    };
-    let properties = external.external_memory_properties;
-    validate_external_import(
-        properties.external_memory_features,
-        properties.compatible_handle_types,
-        label,
-    )?;
-    Ok(properties)
-}
-
-fn query_linear_nv12_staging_capability<D: VulkanDeviceContext>(
-    device: &D,
-    linear: vk::DrmFormatModifierPropertiesEXT,
-    staging_preference: Nv12StagingPreference,
-) -> Result<Nv12ModifierCapability, String> {
-    match staging_preference {
-        Nv12StagingPreference::PreferPlanar => {
-            match query_linear_nv12_transfer_capability(device, linear) {
-                Ok(capability) => Ok(capability),
-                Err(transfer_error) => query_linear_nv12_compute_capability(
-                    device,
-                    linear,
-                    Nv12StagingPreference::PreferPlanar,
-                )
-                .map_err(|compute_error| {
-                    format!(
-                        "Vulkan NV12 has neither optimal transfer nor compute staging support: transfer={transfer_error}; compute={compute_error}"
-                    )
-                }),
-            }
-        }
-        Nv12StagingPreference::RequirePlanar | Nv12StagingPreference::RequireRgba => {
-            query_linear_nv12_compute_capability(device, linear, staging_preference)
-        }
-    }
-}
-
-fn query_linear_nv12_transfer_capability<D: VulkanDeviceContext>(
-    device: &D,
-    linear: vk::DrmFormatModifierPropertiesEXT,
-) -> Result<Nv12ModifierCapability, String> {
-    let queue_flags = selected_queue_flags(device);
-    if !queue_flags
-        .intersects(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER)
-    {
-        return Err("selected Vulkan queue cannot execute buffer-to-image transfers".to_string());
-    }
-    let external = query_external_buffer_properties(
-        device,
-        TRANSFER_NV12_SOURCE_USAGE,
-        "linear NV12 transfer-source buffer",
-    )?;
-    let multi_planar_required = vk::FormatFeatureFlags::SAMPLED_IMAGE
-        | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
-        | vk::FormatFeatureFlags::SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER
-        | vk::FormatFeatureFlags::MIDPOINT_CHROMA_SAMPLES
-        | vk::FormatFeatureFlags::COSITED_CHROMA_SAMPLES
-        | vk::FormatFeatureFlags::TRANSFER_SRC
-        | vk::FormatFeatureFlags::TRANSFER_DST;
-    let (strategy, sampled_features, max_extent) = match query_optimal_staging_format_with_usage(
-        device,
-        IMPORTED_NV12_FORMAT,
-        multi_planar_required,
-        TRANSFER_NV12_OUTPUT_USAGE,
-        vk::ImageCreateFlags::empty(),
-    ) {
-        Ok((features, extent)) => (
-            Nv12ImportStrategy::LinearBufferToOptimalNv12,
-            features,
-            extent,
-        ),
-        Err(multi_planar_error) => {
-            let required = vk::FormatFeatureFlags::SAMPLED_IMAGE
-                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
-                | vk::FormatFeatureFlags::TRANSFER_SRC
-                | vk::FormatFeatureFlags::TRANSFER_DST;
-            let (features, extent) = query_transfer_planar_staging_format(device, required)
-                    .map_err(|planar_error| {
-                        format!(
-                            "Vulkan NV12 has neither exact multi-planar YCbCr nor separate-plane transfer support: multi_planar={multi_planar_error}; separate_planes={planar_error}"
-                        )
-                    })?;
-            (
-                Nv12ImportStrategy::LinearBufferToOptimalYuvPlanes,
-                features,
-                extent,
-            )
-        }
-    };
-    Ok(Nv12ModifierCapability {
-        modifier: DRM_FORMAT_MOD_LINEAR,
-        strategy,
-        modifier_plane_count: linear.drm_format_modifier_plane_count,
-        source_tiling_features: linear.drm_format_modifier_tiling_features,
-        sampled_tiling_features: sampled_features,
-        external_features: external.external_memory_features,
-        compatible_handle_types: external.compatible_handle_types,
-        max_extent,
-    })
-}
-
-fn query_linear_nv12_compute_capability<D: VulkanDeviceContext>(
-    device: &D,
-    linear: vk::DrmFormatModifierPropertiesEXT,
-    staging_preference: Nv12StagingPreference,
-) -> Result<Nv12ModifierCapability, String> {
-    if !selected_queue_flags(device).contains(vk::QueueFlags::COMPUTE) {
-        return Err("selected Vulkan queue cannot execute NV12 compute staging".to_string());
-    }
-    let external = query_external_buffer_properties(
-        device,
-        STAGED_NV12_SOURCE_USAGE,
-        "linear NV12 uniform-texel source buffer",
-    )?;
-
-    let mut source_properties = vk::FormatProperties2::default();
-    unsafe {
-        device.instance().get_physical_device_format_properties2(
-            device.physical_device(),
-            STAGED_NV12_SOURCE_TEXEL_FORMAT,
-            &mut source_properties,
-        )
-    };
-    if !source_properties
-        .format_properties
-        .buffer_features
-        .contains(vk::FormatFeatureFlags::UNIFORM_TEXEL_BUFFER)
-    {
-        return Err("Vulkan R32_UINT source buffers lack uniform-texel-buffer support".to_string());
-    }
-
-    let required = vk::FormatFeatureFlags::SAMPLED_IMAGE
-        | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
-        | vk::FormatFeatureFlags::STORAGE_IMAGE
-        | vk::FormatFeatureFlags::TRANSFER_SRC
-        | vk::FormatFeatureFlags::TRANSFER_DST;
-    let (strategy, sampled_features, max_extent) = match staging_preference {
-        Nv12StagingPreference::PreferPlanar => {
-            match query_planar_staging_format(device, required) {
-                Ok((features, extent)) => (
-                    Nv12ImportStrategy::LinearBufferToYuvPlanes,
-                    features,
-                    extent,
-                ),
-                Err(planar_error) => {
-                    let (features, extent) =
-                        query_optimal_staging_format(device, IMPORTED_RGBA_FORMAT, required).map_err(
-                            |rgba_error| {
-                                format!(
-                                    "Vulkan NV12 has neither planar nor RGBA compute staging support: planar={planar_error}; rgba={rgba_error}"
-                                )
-                            },
-                        )?;
-                    (Nv12ImportStrategy::LinearBufferToRgba, features, extent)
-                }
-            }
-        }
-        Nv12StagingPreference::RequirePlanar => {
-            let (features, extent) = query_planar_staging_format(device, required)
-                .map_err(|error| format!("required planar NV12 staging is unavailable: {error}"))?;
-            (
-                Nv12ImportStrategy::LinearBufferToYuvPlanes,
-                features,
-                extent,
-            )
-        }
-        Nv12StagingPreference::RequireRgba => {
-            let (features, extent) =
-                query_optimal_staging_format(device, IMPORTED_RGBA_FORMAT, required).map_err(
-                    |error| format!("required RGBA NV12 staging is unavailable: {error}"),
-                )?;
-            (Nv12ImportStrategy::LinearBufferToRgba, features, extent)
-        }
-    };
-
-    Ok(Nv12ModifierCapability {
-        modifier: DRM_FORMAT_MOD_LINEAR,
-        strategy,
-        modifier_plane_count: linear.drm_format_modifier_plane_count,
-        source_tiling_features: linear.drm_format_modifier_tiling_features,
-        sampled_tiling_features: sampled_features,
-        external_features: external.external_memory_features,
-        compatible_handle_types: external.compatible_handle_types,
-        max_extent,
-    })
-}
-
-fn query_transfer_planar_staging_format<D: VulkanDeviceContext>(
-    device: &D,
-    required: vk::FormatFeatureFlags,
-) -> Result<(vk::FormatFeatureFlags, vk::Extent3D), String> {
-    query_optimal_staging_format_with_usage(
-        device,
-        STAGED_NV12_LUMA_FORMAT,
-        required,
-        TRANSFER_NV12_OUTPUT_USAGE,
-        vk::ImageCreateFlags::empty(),
-    )
-    .and_then(|(luma_features, luma_extent)| {
-        query_optimal_staging_format_with_usage(
-            device,
-            STAGED_NV12_CHROMA_FORMAT,
-            required,
-            TRANSFER_NV12_OUTPUT_USAGE,
-            vk::ImageCreateFlags::empty(),
-        )
-        .map(|(chroma_features, chroma_extent)| {
-            (
-                luma_features & chroma_features,
-                vk::Extent3D {
-                    width: luma_extent.width.min(chroma_extent.width.saturating_mul(2)),
-                    height: luma_extent
-                        .height
-                        .min(chroma_extent.height.saturating_mul(2)),
-                    depth: 1,
-                },
-            )
-        })
-    })
-}
-
-fn query_planar_staging_format<D: VulkanDeviceContext>(
-    device: &D,
-    required: vk::FormatFeatureFlags,
-) -> Result<(vk::FormatFeatureFlags, vk::Extent3D), String> {
-    query_optimal_staging_format(device, STAGED_NV12_LUMA_FORMAT, required).and_then(
-        |(luma_features, luma_extent)| {
-            query_optimal_staging_format(device, STAGED_NV12_CHROMA_FORMAT, required).map(
-                |(chroma_features, chroma_extent)| {
-                    (
-                        luma_features & chroma_features,
-                        vk::Extent3D {
-                            width: luma_extent.width.min(chroma_extent.width.saturating_mul(2)),
-                            height: luma_extent
-                                .height
-                                .min(chroma_extent.height.saturating_mul(2)),
-                            depth: 1,
-                        },
-                    )
-                },
-            )
-        },
-    )
-}
-
-fn query_optimal_staging_format<D: VulkanDeviceContext>(
-    device: &D,
-    format: vk::Format,
-    required: vk::FormatFeatureFlags,
-) -> Result<(vk::FormatFeatureFlags, vk::Extent3D), String> {
-    query_optimal_staging_format_with_usage(
-        device,
-        format,
-        required,
-        STAGED_NV12_OUTPUT_USAGE,
-        vk::ImageCreateFlags::empty(),
-    )
-}
-
-fn query_optimal_staging_format_with_usage<D: VulkanDeviceContext>(
-    device: &D,
-    format: vk::Format,
-    required: vk::FormatFeatureFlags,
-    usage: vk::ImageUsageFlags,
-    flags: vk::ImageCreateFlags,
-) -> Result<(vk::FormatFeatureFlags, vk::Extent3D), String> {
-    let mut properties = vk::FormatProperties2::default();
-    unsafe {
-        device.instance().get_physical_device_format_properties2(
-            device.physical_device(),
-            format,
-            &mut properties,
-        )
-    };
-    let features = properties.format_properties.optimal_tiling_features;
-    if !features.contains(required) {
-        return Err(format!(
-            "optimal format 0x{:x} lacks required features 0x{:x} (available=0x{:x})",
-            format.as_raw(),
-            required.as_raw(),
-            features.as_raw()
-        ));
-    }
-    let format_info = vk::PhysicalDeviceImageFormatInfo2::default()
-        .format(format)
-        .ty(vk::ImageType::TYPE_2D)
-        .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(usage)
-        .flags(flags);
-    let mut image_properties = vk::ImageFormatProperties2::default();
-    unsafe {
-        device
-            .instance()
-            .get_physical_device_image_format_properties2(
-                device.physical_device(),
-                &format_info,
-                &mut image_properties,
-            )
-    }
-    .map_err(|result| {
-        format!(
-            "Vulkan optimal staging format 0x{:x} is unsupported: {result:?}",
-            format.as_raw()
-        )
-    })?;
-    Ok((
-        features,
-        image_properties.image_format_properties.max_extent,
-    ))
-}
-
-fn validate_external_import(
-    features: vk::ExternalMemoryFeatureFlags,
-    handles: vk::ExternalMemoryHandleTypeFlags,
-    label: &str,
-) -> Result<(), String> {
-    if !features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
-        || !handles.contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-    {
-        return Err(format!("{label} is not Vulkan DMA-BUF importable"));
-    }
-    Ok(())
-}
-
-fn format_modifiers<D: VulkanDeviceContext>(
-    device: &D,
-    format: vk::Format,
-) -> Result<Vec<vk::DrmFormatModifierPropertiesEXT>, String> {
-    let mut count = vk::DrmFormatModifierPropertiesListEXT::default();
-    let mut properties = vk::FormatProperties2::default().push_next(&mut count);
-    unsafe {
-        device.instance().get_physical_device_format_properties2(
-            device.physical_device(),
-            format,
-            &mut properties,
-        )
-    };
-    let mut modifiers = vec![
-        vk::DrmFormatModifierPropertiesEXT::default();
-        usize::try_from(count.drm_format_modifier_count).map_err(|_| {
-            "Vulkan DRM modifier count exceeds usize".to_string()
-        })?
-    ];
-    let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
-        .drm_format_modifier_properties(&mut modifiers);
-    let mut properties = vk::FormatProperties2::default().push_next(&mut list);
-    unsafe {
-        device.instance().get_physical_device_format_properties2(
-            device.physical_device(),
-            format,
-            &mut properties,
-        )
-    };
-    Ok(modifiers)
-}
-
-struct ExternalModifierCapability {
-    external_features: vk::ExternalMemoryFeatureFlags,
-    compatible_handle_types: vk::ExternalMemoryHandleTypeFlags,
-    max_extent: vk::Extent3D,
-}
-
-fn query_external_modifier_capability<D: VulkanDeviceContext>(
-    device: &D,
-    format: vk::Format,
-    modifier: u64,
-    usage: vk::ImageUsageFlags,
-) -> Result<ExternalModifierCapability, String> {
-    let mut modifier_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
-        .drm_format_modifier(modifier)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    let mut external_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
-        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-    let format_info = vk::PhysicalDeviceImageFormatInfo2::default()
-        .format(format)
-        .ty(vk::ImageType::TYPE_2D)
-        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-        .usage(usage)
-        .flags(vk::ImageCreateFlags::empty())
-        .push_next(&mut modifier_info)
-        .push_next(&mut external_info);
-    let mut external_properties = vk::ExternalImageFormatProperties::default();
-    let max_extent = {
-        let mut image_properties =
-            vk::ImageFormatProperties2::default().push_next(&mut external_properties);
-        unsafe {
-            device.instance().get_physical_device_image_format_properties2(
-                device.physical_device(),
-                &format_info,
-                &mut image_properties,
-            )
-        }
-        .map_err(|result| {
-            format!(
-                "Vulkan DMA-BUF modifier {modifier:#018x} is not importable for format 0x{:x}: {result:?}",
-                format.as_raw()
-            )
-        })?;
-        image_properties.image_format_properties.max_extent
-    };
-    let external_memory = external_properties.external_memory_properties;
-    Ok(ExternalModifierCapability {
-        external_features: external_memory.external_memory_features,
-        compatible_handle_types: external_memory.compatible_handle_types,
-        max_extent,
-    })
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn color(chroma_location: ChromaLocation) -> Colorimetry {
-        Colorimetry {
-            primaries: Primaries::Bt709,
-            transfer: Transfer::Bt709,
-            matrix: Matrix::Bt709,
-            range: ColorRange::Limited,
-            chroma_location,
-        }
-    }
-
-    #[test]
-    fn packed_formats_map_to_exact_vulkan_byte_orders_and_topology_keys() {
-        assert_eq!(
-            PackedImageFormat::Rgba8888.vk_format().as_raw(),
-            vk::Format::R8G8B8A8_UNORM.as_raw()
-        );
-        assert_eq!(
-            PackedImageFormat::Bgra8888.vk_format().as_raw(),
-            vk::Format::B8G8R8A8_UNORM.as_raw()
-        );
-        let base = PackedSourceTopology {
-            dimensions: (64, 32),
-            object_size: 8_192,
-            modifier: DRM_FORMAT_MOD_LINEAR,
-            plane: ImportedPlane {
-                offset: 0,
-                pitch: 256,
-            },
-            format: PackedImageFormat::Bgra8888,
-            strategy: PackedImageImportStrategy::DirectSampledImage,
-        };
-        assert_ne!(
-            base,
-            PackedSourceTopology {
-                object_size: 8_448,
-                ..base
-            }
-        );
-        assert_ne!(
-            base,
-            PackedSourceTopology {
-                format: PackedImageFormat::Rgba8888,
-                ..base
-            }
-        );
-        assert_ne!(
-            base,
-            PackedSourceTopology {
-                strategy: PackedImageImportStrategy::LinearBufferToOptimalBgra,
-                ..base
-            }
-        );
-    }
-
-    #[test]
-    fn packed_layout_requires_exact_pitch_and_truthful_object_span() {
-        let plane = ImportedPlane {
-            offset: 64,
-            pitch: 256,
-        };
-        assert!(validate_packed_layout((64, 32), 8_256, plane).is_ok());
-        assert!(
-            validate_packed_layout((64, 32), 8_255, plane)
-                .unwrap_err()
-                .contains("smaller than packed image span")
-        );
-        assert!(
-            validate_packed_layout(
-                (64, 32),
-                8_256,
-                ImportedPlane {
-                    offset: 64,
-                    pitch: 255,
-                },
-            )
-            .unwrap_err()
-            .contains("pitch")
-        );
-    }
-
-    #[test]
-    fn maps_exact_bt709_color_and_siting() {
-        let conversion = map_nv12_colorimetry(color(ChromaLocation::Left)).unwrap();
-        assert_eq!(conversion.model, YcbcrModel::Bt709);
-        assert_eq!(conversion.range, YcbcrRange::Narrow);
-        assert_eq!(conversion.x_offset, YcbcrOffset::CositedEven);
-        assert_eq!(conversion.y_offset, YcbcrOffset::Midpoint);
-        assert!(map_nv12_colorimetry(Colorimetry::default()).is_err());
-        assert!(map_nv12_colorimetry(color(ChromaLocation::Bottom)).is_err());
-    }
-
-    #[test]
-    fn validates_shared_linear_nv12_topology_without_trusting_modifier_plane_inventory() {
-        let layout = validate_nv12_shared_object_topology(
-            (64, 32),
-            &[3_072],
-            &[Some(DRM_FORMAT_MOD_LINEAR)],
-            &[
-                Nv12Plane {
-                    object_index: 0,
-                    offset: 0,
-                    pitch: 64,
-                },
-                Nv12Plane {
-                    object_index: 0,
-                    offset: 2_048,
-                    pitch: 64,
-                },
-            ],
-        )
-        .unwrap();
-        assert_eq!(layout.object_size, 3_072);
-        assert_eq!(layout.planes[1].offset, 2_048);
-    }
-
-    #[test]
-    fn staged_capability_accepts_v3dv_one_plane_inventory_without_calling_it_direct() {
-        let capability = Nv12ModifierCapability {
-            modifier: DRM_FORMAT_MOD_LINEAR,
-            strategy: Nv12ImportStrategy::LinearBufferToYuvPlanes,
-            modifier_plane_count: 1,
-            source_tiling_features: vk::FormatFeatureFlags::TRANSFER_SRC,
-            sampled_tiling_features: vk::FormatFeatureFlags::SAMPLED_IMAGE
-                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
-                | vk::FormatFeatureFlags::STORAGE_IMAGE
-                | vk::FormatFeatureFlags::TRANSFER_SRC
-                | vk::FormatFeatureFlags::TRANSFER_DST,
-            external_features: vk::ExternalMemoryFeatureFlags::IMPORTABLE,
-            compatible_handle_types: vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
-            max_extent: vk::Extent3D {
-                width: 4096,
-                height: 4096,
-                depth: 1,
-            },
-        };
-        validate_nv12_modifier_capability(
-            capability,
-            (64, 32),
-            map_nv12_colorimetry(color(ChromaLocation::Left)).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            capability.allocation_recipe(),
-            Nv12AllocationBindingRecipe::LinearBufferToYuvPlanes
-        );
-    }
-
-    #[test]
-    fn transfer_capabilities_require_their_exact_sampling_and_transfer_features() {
-        let conversion = map_nv12_colorimetry(color(ChromaLocation::Left)).unwrap();
-        let capability = Nv12ModifierCapability {
-            modifier: DRM_FORMAT_MOD_LINEAR,
-            strategy: Nv12ImportStrategy::LinearBufferToOptimalNv12,
-            modifier_plane_count: 1,
-            source_tiling_features: vk::FormatFeatureFlags::empty(),
-            sampled_tiling_features: conversion.required_direct_features()
-                | vk::FormatFeatureFlags::TRANSFER_SRC
-                | vk::FormatFeatureFlags::TRANSFER_DST,
-            external_features: vk::ExternalMemoryFeatureFlags::IMPORTABLE,
-            compatible_handle_types: vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
-            max_extent: vk::Extent3D {
-                width: 4096,
-                height: 4096,
-                depth: 1,
-            },
-        };
-        validate_nv12_modifier_capability(capability, (64, 32), conversion).unwrap();
-        let separate = Nv12ModifierCapability {
-            strategy: Nv12ImportStrategy::LinearBufferToOptimalYuvPlanes,
-            sampled_tiling_features: vk::FormatFeatureFlags::SAMPLED_IMAGE
-                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
-                | vk::FormatFeatureFlags::TRANSFER_SRC
-                | vk::FormatFeatureFlags::TRANSFER_DST,
-            ..capability
-        };
-        validate_nv12_modifier_capability(separate, (64, 32), conversion).unwrap();
-        assert!(
-            validate_nv12_modifier_capability(
-                separate,
-                (64, 32),
-                Nv12Conversion {
-                    model: YcbcrModel::Bt601,
-                    ..conversion
-                },
-            )
-            .is_err()
-        );
-        assert!(
-            validate_nv12_modifier_capability(
-                Nv12ModifierCapability {
-                    sampled_tiling_features: capability.sampled_tiling_features
-                        & !vk::FormatFeatureFlags::TRANSFER_DST,
-                    ..capability
-                },
-                (64, 32),
-                conversion,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn staged_nv12_sources_declare_only_the_selected_read_operation() {
-        assert!(STAGED_NV12_SOURCE_USAGE == vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER);
-        assert!(STAGED_NV12_SOURCE_TEXEL_FORMAT == vk::Format::R32_UINT);
-        assert!(!STAGED_NV12_SOURCE_USAGE.contains(vk::BufferUsageFlags::TRANSFER_SRC));
-        assert!(TRANSFER_NV12_SOURCE_USAGE == vk::BufferUsageFlags::TRANSFER_SRC);
-        assert!(!TRANSFER_NV12_SOURCE_USAGE.contains(vk::BufferUsageFlags::STORAGE_BUFFER));
-    }
-
-    #[test]
-    fn transfer_nv12_outputs_require_no_storage_usage() {
-        assert!(TRANSFER_NV12_OUTPUT_USAGE.contains(vk::ImageUsageFlags::SAMPLED));
-        assert!(TRANSFER_NV12_OUTPUT_USAGE.contains(vk::ImageUsageFlags::TRANSFER_SRC));
-        assert!(TRANSFER_NV12_OUTPUT_USAGE.contains(vk::ImageUsageFlags::TRANSFER_DST));
-        assert!(!TRANSFER_NV12_OUTPUT_USAGE.contains(vk::ImageUsageFlags::STORAGE));
-        let capability = |strategy| Nv12ModifierCapability {
-            modifier: DRM_FORMAT_MOD_LINEAR,
-            strategy,
-            modifier_plane_count: 1,
-            source_tiling_features: vk::FormatFeatureFlags::empty(),
-            sampled_tiling_features: vk::FormatFeatureFlags::empty(),
-            external_features: vk::ExternalMemoryFeatureFlags::empty(),
-            compatible_handle_types: vk::ExternalMemoryHandleTypeFlags::empty(),
-            max_extent: vk::Extent3D::default(),
-        };
-        assert_eq!(
-            capability(Nv12ImportStrategy::LinearBufferToOptimalNv12).allocation_recipe(),
-            Nv12AllocationBindingRecipe::LinearBufferToOptimalNv12
-        );
-        assert_eq!(
-            capability(Nv12ImportStrategy::LinearBufferToOptimalYuvPlanes).allocation_recipe(),
-            Nv12AllocationBindingRecipe::LinearBufferToOptimalYuvPlanes
-        );
-    }
-
-    #[test]
-    fn transfer_regions_preserve_exact_nv12_offsets_pitches_and_plane_extents() {
-        let plan = StagedTransferPlan {
-            source_buffer: vk::Buffer::null(),
-            source_size: 3_824,
-            output: StagedSampledImages::Nv12 {
-                image: vk::Image::null(),
-            },
-            output_initialized: false,
-            dimensions: (64, 32),
-            planes: [
-                ImportedPlane {
-                    offset: 0,
-                    pitch: 80,
-                },
-                ImportedPlane {
-                    offset: 2_560,
-                    pitch: 80,
-                },
-            ],
-        };
-        let regions = sync::nv12_multiplanar_transfer_regions(plan);
-        assert_eq!(regions[0].buffer_offset, 0);
-        assert_eq!(regions[0].buffer_row_length, 80);
-        assert!(regions[0].image_subresource.aspect_mask == vk::ImageAspectFlags::PLANE_0);
-        assert_eq!(regions[0].image_extent.width, 64);
-        assert_eq!(regions[0].image_extent.height, 32);
-        assert_eq!(regions[1].buffer_offset, 2_560);
-        assert_eq!(regions[1].buffer_row_length, 40);
-        assert!(regions[1].image_subresource.aspect_mask == vk::ImageAspectFlags::PLANE_1);
-        assert_eq!(regions[1].image_extent.width, 32);
-        assert_eq!(regions[1].image_extent.height, 16);
-
-        let separate = sync::nv12_separate_transfer_regions(plan);
-        assert!(
-            separate
-                .iter()
-                .all(|region| region.image_subresource.aspect_mask == vk::ImageAspectFlags::COLOR)
-        );
-        assert_eq!(separate[0].buffer_row_length, 80);
-        assert_eq!(separate[1].buffer_row_length, 40);
-    }
-
-    #[test]
-    fn transfer_layout_fails_closed_on_unaligned_plane_offsets() {
-        let layout = Nv12SharedObjectLayout {
-            modifier: DRM_FORMAT_MOD_LINEAR,
-            object_size: 3_840,
-            planes: [
-                ImportedPlane {
-                    offset: 2,
-                    pitch: 64,
-                },
-                ImportedPlane {
-                    offset: 2_048,
-                    pitch: 64,
-                },
-            ],
-        };
-        assert!(validate_transfer_layout((64, 32), layout).is_err());
-
-        let valid = Nv12SharedObjectLayout {
-            modifier: DRM_FORMAT_MOD_LINEAR,
-            object_size: 3_840,
-            planes: [
-                ImportedPlane {
-                    offset: 0,
-                    pitch: 80,
-                },
-                ImportedPlane {
-                    offset: 2_560,
-                    pitch: 80,
-                },
-            ],
-        };
-        assert!(validate_transfer_layout((64, 32), valid).is_ok());
-        assert_eq!(nv12_transfer_source_span((64, 32), valid).unwrap(), 3_824);
-
-        let camera = Nv12SharedObjectLayout {
-            modifier: DRM_FORMAT_MOD_LINEAR,
-            object_size: 5_529_856,
-            planes: [
-                ImportedPlane {
-                    offset: 0,
-                    pitch: 2_560,
-                },
-                ImportedPlane {
-                    offset: 3_686_400,
-                    pitch: 2_560,
-                },
-            ],
-        };
-        assert_eq!(
-            nv12_transfer_source_span((2_560, 1_440), camera).unwrap(),
-            5_529_600
-        );
-        assert_eq!(camera.object_size - 5_529_600, 256);
-        assert!(
-            validate_transfer_layout(
-                (64, 32),
-                Nv12SharedObjectLayout {
-                    object_size: 3_800,
-                    ..valid
-                },
-            )
-            .is_err()
-        );
-        assert!(
-            validate_transfer_layout(
-                (64, 32),
-                Nv12SharedObjectLayout {
-                    planes: [
-                        valid.planes[0],
-                        ImportedPlane {
-                            pitch: 79,
-                            ..valid.planes[1]
-                        },
-                    ],
-                    ..valid
-                },
-            )
-            .is_err()
-        );
-        assert!(validate_transfer_layout((63, 32), valid).is_err());
-    }
-
-    #[test]
-    fn staged_packed_source_uses_bounded_texel_fetch_and_mutable_bgra_output() {
-        assert!(STAGED_PACKED_SOURCE_USAGE == vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER);
-        assert!(STAGED_PACKED_SOURCE_TEXEL_FORMAT == vk::Format::R32_UINT);
-        assert!(STAGED_PACKED_STORAGE_VIEW_FORMAT == vk::Format::R32_UINT);
-        assert!(STAGED_PACKED_OUTPUT_USAGE.contains(vk::ImageUsageFlags::SAMPLED));
-        assert!(STAGED_PACKED_OUTPUT_USAGE.contains(vk::ImageUsageFlags::STORAGE));
-        assert!(!STAGED_PACKED_SOURCE_USAGE.contains(vk::BufferUsageFlags::TRANSFER_SRC));
-
-        let bgra_word = |bytes: [u8; 4], format| match format {
-            PackedImageFormat::Rgba8888 => {
-                u32::from(bytes[2])
-                    | (u32::from(bytes[1]) << 8)
-                    | (u32::from(bytes[0]) << 16)
-                    | (u32::from(bytes[3]) << 24)
-            }
-            PackedImageFormat::Bgra8888 => {
-                u32::from(bytes[0])
-                    | (u32::from(bytes[1]) << 8)
-                    | (u32::from(bytes[2]) << 16)
-                    | (255 << 24)
-            }
-        };
-        assert_eq!(
-            bgra_word([0x11, 0x22, 0x33, 0x44], PackedImageFormat::Rgba8888),
-            0x4411_2233
-        );
-        assert_eq!(
-            bgra_word([0x33, 0x22, 0x11, 0x00], PackedImageFormat::Bgra8888),
-            0xff11_2233
-        );
-    }
-
-    #[test]
-    fn staged_outputs_declare_ganesh_transfer_compatibility_without_exposing_the_source() {
-        assert!(STAGED_NV12_OUTPUT_USAGE.contains(vk::ImageUsageFlags::SAMPLED));
-        assert!(STAGED_NV12_OUTPUT_USAGE.contains(vk::ImageUsageFlags::STORAGE));
-        assert!(STAGED_NV12_OUTPUT_USAGE.contains(vk::ImageUsageFlags::TRANSFER_SRC));
-        assert!(STAGED_NV12_OUTPUT_USAGE.contains(vk::ImageUsageFlags::TRANSFER_DST));
-        assert!(!STAGED_NV12_SOURCE_USAGE.contains(vk::BufferUsageFlags::TRANSFER_SRC));
-        assert!(!STAGED_NV12_SOURCE_USAGE.contains(vk::BufferUsageFlags::TRANSFER_DST));
-    }
-
-    #[test]
-    fn embedded_compute_shaders_are_valid_spirv() {
-        for output in [Nv12ComputeOutput::Rgba, Nv12ComputeOutput::YuvPlanes] {
-            let words = shader_words(output).unwrap();
-            assert_eq!(words.first().copied(), Some(0x0723_0203));
-            assert!(words.len() > 16);
-        }
-        let packed = packed_shader_words().unwrap();
-        assert_eq!(packed.first().copied(), Some(0x0723_0203));
-        assert!(packed.len() > 16);
-        assert!(std::mem::size_of::<Nv12PushConstants>() <= 128);
-        assert!(std::mem::size_of::<PackedPushConstants>() <= 128);
-    }
-
-    #[test]
-    fn default_import_pools_cover_camera_buffers_and_in_flight_outputs() {
-        let limits = VulkanImportPoolLimits::default();
-        assert!(limits.nv12_source_cache_entries >= 10);
-        assert!(limits.nv12_output_slots >= 4);
-        assert!(limits.packed_source_cache_entries >= 10);
-        assert!(limits.packed_output_slots >= 4);
-    }
-
-    #[test]
-    fn cached_source_active_reappearance_fails_closed_until_exact_release() {
-        let claimed = AtomicBool::new(false);
-        claim_idle_source(&claimed).unwrap();
-        assert!(claim_idle_source(&claimed).is_err());
-        assert!(claimed.swap(false, Ordering::AcqRel));
-        claim_idle_source(&claimed).unwrap();
-    }
-
-    #[test]
-    fn source_cache_identity_includes_stream_inode_and_exact_topology() {
-        let topology = Nv12FrameTopology {
-            dimensions: (64, 32),
-            object_count: 1,
-            object_size: 3_072,
-            plane_count: 2,
-            planes: [
-                Nv12Plane {
-                    object_index: 0,
-                    offset: 0,
-                    pitch: 64,
-                },
-                Nv12Plane {
-                    object_index: 0,
-                    offset: 2_048,
-                    pitch: 64,
-                },
-            ],
-            modifier: DRM_FORMAT_MOD_LINEAR,
-        };
-        let key = Nv12SourceCacheKey {
-            stream_incarnation: 7,
-            device: 3,
-            inode: 11,
-            topology,
-            strategy: Nv12ImportStrategy::LinearBufferToYuvPlanes,
-        };
-        assert_ne!(
-            key,
-            Nv12SourceCacheKey {
-                stream_incarnation: 8,
-                ..key
-            }
-        );
-        assert_ne!(key, Nv12SourceCacheKey { inode: 12, ..key });
-        assert_ne!(
-            key,
-            Nv12SourceCacheKey {
-                topology: Nv12FrameTopology {
-                    object_size: 3_328,
-                    ..topology
-                },
-                ..key
-            }
-        );
-        assert_ne!(
-            key,
-            Nv12SourceCacheKey {
-                strategy: Nv12ImportStrategy::LinearBufferToOptimalNv12,
-                ..key
-            }
-        );
-    }
-
-    #[test]
-    fn planar_chroma_coordinates_match_left_and_midpoint_definitions() {
-        let reconstructed_coordinate = |pixel: u32, offset: YcbcrOffset| {
-            let p = pixel as f32 + 0.5;
-            let image_shader_coordinate = p * 0.5
-                + match offset {
-                    YcbcrOffset::CositedEven => 0.25,
-                    YcbcrOffset::Midpoint => 0.0,
-                };
-            image_shader_coordinate - 0.5
-        };
-        assert_eq!(reconstructed_coordinate(0, YcbcrOffset::CositedEven), 0.0);
-        assert_eq!(reconstructed_coordinate(1, YcbcrOffset::CositedEven), 0.5);
-        assert_eq!(reconstructed_coordinate(0, YcbcrOffset::Midpoint), -0.25);
-        assert_eq!(reconstructed_coordinate(1, YcbcrOffset::Midpoint), 0.25);
-    }
-
-    #[test]
-    fn direct_capability_still_requires_truthful_two_plane_linear_filter_support() {
-        let conversion = map_nv12_colorimetry(color(ChromaLocation::Left)).unwrap();
-        let capability = Nv12ModifierCapability {
-            modifier: 7,
-            strategy: Nv12ImportStrategy::DirectSampledImage,
-            modifier_plane_count: 1,
-            source_tiling_features: conversion.required_direct_features(),
-            sampled_tiling_features: conversion.required_direct_features(),
-            external_features: vk::ExternalMemoryFeatureFlags::IMPORTABLE,
-            compatible_handle_types: vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
-            max_extent: vk::Extent3D {
-                width: 4096,
-                height: 4096,
-                depth: 1,
-            },
-        };
-        assert!(validate_nv12_modifier_capability(capability, (64, 32), conversion).is_err());
-    }
-}
+mod tests;

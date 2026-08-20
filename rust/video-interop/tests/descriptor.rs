@@ -69,6 +69,21 @@ fn rejects_oversized_avdrm_descriptors() {
 }
 
 #[test]
+fn rejects_unreferenced_objects() {
+    let mut descriptor = nv12_descriptor();
+    descriptor.objects.push(Object {
+        fd: 4,
+        size: 4_096,
+        modifier: Modifier::linear(),
+    });
+
+    assert_eq!(
+        descriptor.validate(),
+        Err(ValidationError::UnreferencedObject { index: 1 })
+    );
+}
+
+#[test]
 fn rejects_invalid_object_index() {
     let mut descriptor = nv12_descriptor();
     descriptor.layers[0].planes[1].object_index = 1;

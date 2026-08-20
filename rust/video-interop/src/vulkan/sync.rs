@@ -9,8 +9,8 @@ use std::{
 use ash::vk;
 
 use super::{
-    AcquirePlan, ImportedDmaBufImage, StagedAcquirePlan, StagedSampledImages, StagedTransferPlan,
-    VulkanDeviceContext, duplicate_import_fd,
+    AcquirePlan, ImportId, ImportedDmaBufImage, StagedAcquirePlan, StagedSampledImages,
+    StagedTransferPlan, VulkanDeviceContext, duplicate_import_fd,
 };
 
 /// DMA-BUF ownership outside this logical Vulkan device. The core external family is used rather
@@ -98,7 +98,11 @@ pub struct ImportedImageSync<D: VulkanDeviceContext> {
     release_fence: vk::Fence,
     imported_acquire: Option<vk::Semaphore>,
     ready_semaphore: Option<vk::Semaphore>,
+    import_id: Option<ImportId>,
+    staged_import: bool,
     acquire_submitted: bool,
+    renderer_accepted: bool,
+    renderer_rejected: bool,
     release_submitted: bool,
     timestamp_query: Option<TimestampQuery>,
     timing_active: bool,
@@ -176,7 +180,11 @@ impl<D: VulkanDeviceContext> ImportedImageSync<D> {
                 release_fence,
                 imported_acquire: None,
                 ready_semaphore: None,
+                import_id: None,
+                staged_import: false,
                 acquire_submitted: false,
+                renderer_accepted: false,
+                renderer_rejected: false,
                 release_submitted: false,
                 timestamp_query,
                 timing_active: false,
@@ -195,7 +203,13 @@ impl<D: VulkanDeviceContext> ImportedImageSync<D> {
 
     /// Imports a producer sync file as a temporary payload and submits the complete external
     /// acquire operation. The returned semaphore must be accepted and destroyed by the renderer.
-    pub fn submit_acquire(
+    ///
+    /// # Safety
+    ///
+    /// `imported` and every allocation it owns must remain alive until this lane's release fence
+    /// completes or the complete device is quarantined and destroyed. Renderer queue use must obey
+    /// the context's external-synchronization contract.
+    pub unsafe fn submit_acquire(
         &mut self,
         imported: &ImportedDmaBufImage<D>,
         acquire_sync_fd: Option<i32>,
@@ -207,6 +221,7 @@ impl<D: VulkanDeviceContext> ImportedImageSync<D> {
             ));
         }
         self.timing_active = imported.is_staged();
+        let import_id = imported.import_id();
         let imported_acquire = acquire_sync_fd
             .map(|fd| {
                 import_temporary_sync_fd(self.device.as_ref(), fd, self.imported_acquire).map_err(
@@ -233,12 +248,13 @@ impl<D: VulkanDeviceContext> ImportedImageSync<D> {
                 format!("failed to create imported-image ready semaphore: {result:?}"),
             )
         })?;
-        unsafe { self.device.device().reset_fences(&[self.acquire_fence]) }.map_err(|result| {
-            ImportedImageSyncError::new(
+        if let Err(result) = unsafe { self.device.device().reset_fences(&[self.acquire_fence]) } {
+            unsafe { self.device.device().destroy_semaphore(ready, None) };
+            return Err(ImportedImageSyncError::new(
                 ImportedImageSyncErrorKind::AcquireSubmit,
                 format!("failed to reset staged source fence: {result:?}"),
-            )
-        })?;
+            ));
+        }
         if let Err(error) = self.record_acquire(imported.acquire_plan()) {
             unsafe { self.device.device().destroy_semaphore(ready, None) };
             return Err(ImportedImageSyncError::new(
@@ -257,11 +273,12 @@ impl<D: VulkanDeviceContext> ImportedImageSync<D> {
             .signal_semaphores(&signals);
         match unsafe {
             self.device
-                .device()
-                .queue_submit(self.device.queue(), &[submit], self.acquire_fence)
+                .submit_video_queue(&[submit], self.acquire_fence)
         } {
             Ok(()) => {
                 imported.mark_acquire_submitted();
+                self.import_id = Some(import_id);
+                self.staged_import = imported.is_staged();
                 self.acquire_submitted = true;
                 self.ready_semaphore = Some(ready);
                 Ok(ready)
@@ -269,6 +286,8 @@ impl<D: VulkanDeviceContext> ImportedImageSync<D> {
             Err(vk::Result::ERROR_DEVICE_LOST) => {
                 // Submission consumption is unknowable. Retain all children in the caller's
                 // quarantine owner rather than destroying potentially live semaphore payloads.
+                self.import_id = Some(import_id);
+                self.staged_import = imported.is_staged();
                 self.acquire_submitted = true;
                 self.ready_semaphore = Some(ready);
                 self.device.mark_device_lost();
@@ -316,11 +335,14 @@ impl<D: VulkanDeviceContext> ImportedImageSync<D> {
     /// Polls the exact staged conversion/source-release submission. A true result proves that the
     /// producer DMA-BUF has been returned to the external queue family and its canonical lease may
     /// retire even while the renderer-native output remains displayed.
-    pub fn source_release_complete(
-        &self,
-        imported: &ImportedDmaBufImage<D>,
-    ) -> Result<bool, ImportedImageSyncError> {
-        if !imported.is_staged() {
+    pub fn source_release_complete(&self) -> Result<bool, ImportedImageSyncError> {
+        if !self.acquire_submitted {
+            return Err(ImportedImageSyncError::new(
+                ImportedImageSyncErrorKind::SourceFencePoll,
+                "cannot poll staged source release before acquire submission".to_string(),
+            ));
+        }
+        if !self.staged_import {
             return Ok(false);
         }
         match unsafe { self.device.device().get_fence_status(self.acquire_fence) } {
@@ -344,6 +366,18 @@ impl<D: VulkanDeviceContext> ImportedImageSync<D> {
             return Err("unexpected imported-image ready semaphore".to_string());
         }
         self.ready_semaphore = None;
+        self.renderer_accepted = true;
+        Ok(())
+    }
+
+    /// Records that the renderer rejected the one-shot wait without taking semaphore ownership.
+    /// The semaphore remains owned by this lane until the ordered release fence proves its signal
+    /// operation complete.
+    pub fn ganesh_wait_rejected(&mut self, semaphore: vk::Semaphore) -> Result<(), String> {
+        if self.ready_semaphore != Some(semaphore) {
+            return Err("unexpected rejected imported-image ready semaphore".to_string());
+        }
+        self.renderer_rejected = true;
         Ok(())
     }
 
@@ -358,6 +392,22 @@ impl<D: VulkanDeviceContext> ImportedImageSync<D> {
             return Err(ImportedImageSyncError::new(
                 ImportedImageSyncErrorKind::ReleaseSubmit,
                 "imported Vulkan image release was already submitted".to_string(),
+            ));
+        }
+        if !self.acquire_submitted || (!self.renderer_accepted && !self.renderer_rejected) {
+            return Err(ImportedImageSyncError::new(
+                ImportedImageSyncErrorKind::ReleaseSubmit,
+                "cannot release an imported Vulkan image before renderer acceptance".to_string(),
+            ));
+        }
+        if self.import_id != Some(imported.import_id()) {
+            return Err(ImportedImageSyncError::new(
+                ImportedImageSyncErrorKind::ReleaseSubmit,
+                format!(
+                    "imported Vulkan image release id {} does not match acquired id {}",
+                    imported.import_id().get(),
+                    self.import_id.map(ImportId::get).unwrap_or(0)
+                ),
             ));
         }
         unsafe { self.device.device().reset_fences(&[self.release_fence]) }.map_err(|result| {
@@ -393,8 +443,7 @@ impl<D: VulkanDeviceContext> ImportedImageSync<D> {
         let submit = vk::SubmitInfo::default().command_buffers(&commands);
         match unsafe {
             self.device
-                .device()
-                .queue_submit(self.device.queue(), &[submit], self.release_fence)
+                .submit_video_queue(&[submit], self.release_fence)
         } {
             Ok(()) => {
                 self.release_submitted = true;
@@ -452,10 +501,24 @@ impl<D: VulkanDeviceContext> ImportedImageSync<D> {
         }
         let complete = unsafe { self.device.device().get_fence_status(self.release_fence) }
             .map_err(|result| format!("failed to prove Vulkan sync lane idle: {result:?}"))?;
-        if !complete || self.ready_semaphore.is_some() {
+        if !complete {
             return Err("cannot reuse Vulkan image sync before exact completion".to_string());
         }
+        if self.renderer_rejected
+            && let Some(semaphore) = self.ready_semaphore.take()
+        {
+            unsafe { self.device.device().destroy_semaphore(semaphore, None) };
+        }
+        if self.ready_semaphore.is_some() {
+            return Err(
+                "cannot reuse Vulkan image sync with an unaccepted ready semaphore".to_string(),
+            );
+        }
+        self.import_id = None;
+        self.staged_import = false;
         self.acquire_submitted = false;
+        self.renderer_accepted = false;
+        self.renderer_rejected = false;
         self.release_submitted = false;
         self.timing_active = false;
         self.timing_collected.store(false, Ordering::Release);
@@ -511,6 +574,23 @@ impl<D: VulkanDeviceContext> ImportedImageSync<D> {
 
 impl<D: VulkanDeviceContext> Drop for ImportedImageSync<D> {
     fn drop(&mut self) {
+        let safe_to_destroy = if !self.acquire_submitted {
+            true
+        } else if self.release_submitted {
+            matches!(
+                unsafe { self.device.device().get_fence_status(self.release_fence) },
+                Ok(true)
+            )
+        } else {
+            false
+        };
+        if !safe_to_destroy {
+            // Submission or renderer use may still reference every child below. Individual
+            // destruction would violate Vulkan lifetime rules. Quarantine the complete device and
+            // intentionally leave these raw handles for vkDestroyDevice.
+            self.device.mark_device_lost();
+            return;
+        }
         unsafe {
             if let Some(semaphore) = self.imported_acquire.take() {
                 self.device.device().destroy_semaphore(semaphore, None);

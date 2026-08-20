@@ -30,7 +30,33 @@ jobs:
       - run: cargo test --workspace
       - run: cargo test -p video-interop --no-default-features
       - run: cargo test -p video-interop --no-default-features --features egl
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test -p video-interop --no-default-features --features vulkan
+      - run: cargo test --workspace --all-features
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo clippy -p video-interop --no-default-features --all-targets -- -D warnings
       - run: cargo clippy -p video-interop --no-default-features --features egl --all-targets -- -D warnings
+      - run: cargo clippy -p video-interop --no-default-features --features vulkan --all-targets -- -D warnings
       - run: cargo package -p video-interop --allow-dirty
+      - run: cargo test --manifest-path target/package/video-interop-0.1.0/Cargo.toml --no-default-features --features vulkan
+
+  shaders:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build pinned shader tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build python3
+          git clone https://github.com/KhronosGroup/glslang.git "$RUNNER_TEMP/glslang"
+          git -C "$RUNNER_TEMP/glslang" checkout 168d452a4f460d24b588fed08477a81c44ee27a1
+          (cd "$RUNNER_TEMP/glslang" && python3 update_glslang_sources.py)
+          cmake -S "$RUNNER_TEMP/glslang" -B "$RUNNER_TEMP/glslang-build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/glslang-install" \
+            -DBUILD_TESTING=OFF
+          cmake --build "$RUNNER_TEMP/glslang-build" --target install
+          echo "$RUNNER_TEMP/glslang-install/bin" >> "$GITHUB_PATH"
+      - name: Verify generated SPIR-V
+        env:
+          VIDEO_INTEROP_REQUIRE_PINNED_SHADER_TOOLS: "1"
+        run: scripts/check-vulkan-shaders.sh

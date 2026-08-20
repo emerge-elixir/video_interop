@@ -220,15 +220,15 @@ defmodule VideoInterop.AbandonmentGuardTest do
     assert :ok = LeaseOwner.close(owner)
   end
 
-  test "late guard replies and cancellation races release transactionally" do
+  test "timed-out issue reservation never publishes a guard or transfers its token" do
     {owner, _dispatcher} = start_guarded_owner()
     :ok = :sys.suspend(owner)
 
-    assert {:error, {:transferred, :timeout}} =
+    assert {:error, {:caller_owned, :timeout}} =
              LeaseOwner.issue(owner, :timed_out_guard, timeout: 10)
 
     :ok = :sys.resume(owner)
-    assert_receive {:backend_released, :timed_out_guard}, 1_000
+    refute_receive {:backend_released, :timed_out_guard}, 20
     eventually(fn -> LeaseOwner.stats(owner).active_holders == 0 end)
     assert LeaseOwner.stats(owner).duplicate_releases == 0
     assert :ok = LeaseOwner.close(owner)

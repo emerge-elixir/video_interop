@@ -17,6 +17,7 @@ defmodule VideoInterop.SchemaNative do
   def shutdown_dispatcher_timeout(_owner, _timeout_ms), do: :erlang.nif_error(:nif_not_loaded)
   def delay_dispatcher_for_test(_owner, _delay_ms), do: :erlang.nif_error(:nif_not_loaded)
   def dispatcher_health(_probe), do: :erlang.nif_error(:nif_not_loaded)
+  def dispatcher_undelivered_commands(_probe), do: :erlang.nif_error(:nif_not_loaded)
 
   @behaviour VideoInterop.AbandonmentGuard
 
