@@ -607,7 +607,7 @@ Before changing any consumer repository:
    - `/workspace/emerge-headless`;
    - `/workspace/emerge_demo`;
    - `/workspace/emerge_video_demo`;
-   - `/workspace/colibri/membrane_video_surfaces`;
+   - `/workspace/colibri/membrane_video_transcode`;
    - `/workspace/colibri/membrane_libcamera`;
    - `/workspace/colibri/camera`.
 2. For each dirty worktree with a valid `HEAD` create:
@@ -879,7 +879,7 @@ with frames in flight.
 Migrate atomically:
 
 ```text
-/workspace/colibri/membrane_video_surfaces
+/workspace/colibri/membrane_video_transcode
 /workspace/colibri/membrane_libcamera
 /workspace/emerge_video_demo
 /workspace/colibri/camera

@@ -236,7 +236,7 @@ is not a Membrane component and must depend directly on `video_interop`, not
 The detailed native claim point, direct connection state machine, stop behavior,
 and tests are defined in `library-owned-video-lifecycle.md`.
 
-## Phase 3: migrate `membrane_video_surfaces`
+## Phase 3: migrate `membrane_video_transcode`
 
 Update Mix dependencies to direct `video_interop` plus
 `membrane_video_interop`. Update the decoder NIF from `membrane-dmabuf` to
@@ -434,7 +434,7 @@ Assert the Hex archive contains only Membrane adapter code and dependencies.
 
 - full Emerge default/raster-only/DRM tests and Clippy matrix;
 - demo PRIME validation tests;
-- `membrane_video_surfaces` Mix and native Rust suites;
+- `membrane_video_transcode` Mix and native Rust suites;
 - `membrane_libcamera` host/mock/native suites;
 - camera host tests and RPi5 cross-build;
 - `git diff --check` and lockfile/package resolution in every repository.
@@ -471,7 +471,7 @@ Publish only after lockstep validation:
 2. Hex `video_interop`;
 3. Hex `membrane_video_interop`;
 4. Emerge/precompiled NIF release;
-5. `membrane_video_surfaces`;
+5. `membrane_video_transcode`;
 6. `membrane_libcamera`;
 7. downstream camera firmware/application.
 
