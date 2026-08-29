@@ -18,8 +18,9 @@ mod beam;
 
 pub use dmabuf::{
     AV_DRM_MAX_ENTRIES, Descriptor, Layer, Object, OwnedDescriptor, OwnedObject, Plane,
+    dmabuf_allocation_size,
 };
-pub use error::{DuplicateError, ValidationError};
+pub use error::{DmaBufAllocationSizeError, DuplicateError, ValidationError};
 pub use format::{
     AcquireSyncPolicy, AlphaMode, ChromaLocation, ColorRange, Colorimetry, DmaBufFormat, Format,
     FormatValidationError, InterlaceMode, Matrix, ModifierPolicy, Primaries, Rational,

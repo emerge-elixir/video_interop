@@ -14,9 +14,12 @@ video-interop = { version = "0.1", default-features = false }
 ```
 
 Version 0.1 supports process-local Linux DMA-BUF descriptors and acquire
-sync-file fences. Its optional Rustler module also provides lifecycle-owned
-release dispatchers, thin per-holder abandonment-guard construction, and
-prepared/claimed lease types that preserve the complete authority envelope
+sync-file fences. `dmabuf_allocation_size` gives producers and consumers one
+canonical `SEEK_END`/`fstat` query for the complete fd-backed allocation. That
+size may include exporter alignment after the final visible plane byte; it is
+not a logical packed or NV12 plane span. Its optional Rustler module also
+provides lifecycle-owned release dispatchers, thin per-holder abandonment-guard
+construction, and prepared/claimed lease types that preserve the complete authority envelope
 through native retirement. A lifecycle-owned dirty-I/O NIF explicitly calls
 `ReleaseDispatcher::close_and_join` after exact claim drainage. Resource and
 guard destructors never wait, join, or send `OwnedEnv` messages; dropping an

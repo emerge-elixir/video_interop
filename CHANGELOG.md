@@ -35,6 +35,8 @@
 - Count dispatcher delivery to dead local owners separately from fatal worker/channel corruption.
 - Verify DMA-BUF allocation sizes against the fd, reject unreferenced descriptor objects, and bound
   compute NV12 shader addressing to its logical 32-bit source span.
+- Expose the canonical fd-backed DMA-BUF allocation-size probe to producers so descriptor
+  publication and strict Vulkan import use identical `SEEK_END`/`fstat` semantics.
 - Bind Vulkan synchronization lanes to unique import identities, enforce renderer wait/release
   ordering, route queue submission through renderer-owned authority, and quarantine uncertain drop.
 - Inventory and resolve multiple NV12 candidates per modifier, preserve forced fail-closed modes,

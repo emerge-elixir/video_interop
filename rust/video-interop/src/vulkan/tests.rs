@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn color(chroma_location: ChromaLocation) -> Colorimetry {

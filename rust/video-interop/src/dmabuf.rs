@@ -1,8 +1,78 @@
-use std::{collections::BTreeSet, os::fd::OwnedFd};
+use std::{
+    collections::BTreeSet,
+    os::fd::{OwnedFd, RawFd},
+};
 
-use crate::{DuplicateError, Modifier, ValidationError, duplicate_fd_cloexec};
+use crate::{
+    DmaBufAllocationSizeError, DuplicateError, Modifier, ValidationError, duplicate_fd_cloexec,
+};
 
 pub const AV_DRM_MAX_ENTRIES: usize = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DmaBufProbe {
+    pub device: u64,
+    pub inode: u64,
+    pub allocation_size: u64,
+}
+
+/// Returns the complete allocation size exposed by a DMA-BUF fd.
+///
+/// This is not a visible image or plane span. Exporters may include real alignment padding after
+/// the final addressable plane byte, and canonical descriptors must publish that complete size.
+pub fn dmabuf_allocation_size(fd: RawFd) -> Result<u64, DmaBufAllocationSizeError> {
+    probe_dmabuf(fd).map(|probe| probe.allocation_size)
+}
+
+pub(crate) fn probe_dmabuf(fd: RawFd) -> Result<DmaBufProbe, DmaBufAllocationSizeError> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `stat` points to writable storage and this call does not take ownership of `fd`.
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return Err(DmaBufAllocationSizeError::Stat(
+            std::io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: fstat initialized the complete structure after returning success.
+    let stat = unsafe { stat.assume_init() };
+
+    // Linux DMA-BUF exporters expose their complete allocation through SEEK_END. Preserve the
+    // shared file position when this fd also supports SEEK_CUR/SEEK_SET.
+    let original_position = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+    let allocation_end = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
+    let seek_error = (allocation_end < 0).then(std::io::Error::last_os_error);
+    if original_position >= 0 && unsafe { libc::lseek(fd, original_position, libc::SEEK_SET) } < 0 {
+        return Err(DmaBufAllocationSizeError::Restore(
+            std::io::Error::last_os_error(),
+        ));
+    }
+    if let Some(error) = seek_error {
+        return Err(DmaBufAllocationSizeError::Seek(error));
+    }
+
+    let allocation_size =
+        u64::try_from(allocation_end).expect("a non-negative off_t always fits in u64");
+    if allocation_size == 0 {
+        return Err(DmaBufAllocationSizeError::Zero);
+    }
+    if stat.st_size < 0 {
+        return Err(DmaBufAllocationSizeError::NegativeStat(stat.st_size));
+    }
+    if stat.st_size > 0 {
+        let stat_size = u64::try_from(stat.st_size).expect("a positive off_t always fits in u64");
+        if stat_size != allocation_size {
+            return Err(DmaBufAllocationSizeError::ProbeMismatch {
+                stat: stat_size,
+                seek_end: allocation_size,
+            });
+        }
+    }
+
+    Ok(DmaBufProbe {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+        allocation_size,
+    })
+}
 
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "rustler", derive(rustler::NifStruct))]
@@ -268,10 +338,60 @@ mod rustler_impl {
 mod tests {
     use std::fs::File;
     use std::io;
-    use std::os::fd::{AsRawFd, RawFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
-    use super::{Descriptor, Layer, Modifier, Object, Plane};
-    use crate::duplicate_fd_cloexec;
+    use super::{Descriptor, Layer, Modifier, Object, Plane, dmabuf_allocation_size};
+    use crate::{DmaBufAllocationSizeError, duplicate_fd_cloexec};
+
+    #[cfg(target_os = "linux")]
+    fn memfd(size: i64) -> OwnedFd {
+        let raw =
+            unsafe { libc::memfd_create(c"video-interop-size-test".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(raw >= 0);
+        assert_eq!(unsafe { libc::ftruncate(raw, size) }, 0);
+        // SAFETY: memfd_create returned one owned descriptor.
+        unsafe { OwnedFd::from_raw_fd(raw) }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn allocation_size_reports_complete_size_and_restores_position() {
+        let fd = memfd(4_096);
+        assert_eq!(
+            unsafe { libc::lseek(fd.as_raw_fd(), 17, libc::SEEK_SET) },
+            17
+        );
+
+        assert_eq!(dmabuf_allocation_size(fd.as_raw_fd()).unwrap(), 4_096);
+        assert_eq!(
+            unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_CUR) },
+            17
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn allocation_size_rejects_zero_and_nonseekable_fds() {
+        let empty = memfd(0);
+        assert!(matches!(
+            dmabuf_allocation_size(empty.as_raw_fd()),
+            Err(DmaBufAllocationSizeError::Zero)
+        ));
+
+        let mut pipe = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        // SAFETY: pipe2 returned two owned descriptors.
+        let read = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+        // SAFETY: pipe2 returned two owned descriptors.
+        let _write = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+        assert!(matches!(
+            dmabuf_allocation_size(read.as_raw_fd()),
+            Err(DmaBufAllocationSizeError::Seek(_))
+        ));
+    }
 
     #[test]
     fn closes_earlier_duplicates_when_a_later_duplicate_fails() {

@@ -2892,14 +2892,11 @@ impl<D: VulkanDeviceContext> Drop for PackedComputePipeline<D> {
 }
 
 fn packed_shader_words() -> Result<Vec<u32>, String> {
-    let bytes = include_bytes!("packed_to_bgra.comp.spv");
-    if !bytes.len().is_multiple_of(4) {
+    let (words, remainder) = include_bytes!("packed_to_bgra.comp.spv").as_chunks::<4>();
+    if !remainder.is_empty() {
         return Err("embedded packed compute shader has an invalid byte length".to_string());
     }
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
-        .collect())
+    Ok(words.iter().copied().map(u32::from_le_bytes).collect())
 }
 
 fn shader_words(output: Nv12ComputeOutput) -> Result<Vec<u32>, String> {
@@ -2907,13 +2904,11 @@ fn shader_words(output: Nv12ComputeOutput) -> Result<Vec<u32>, String> {
         Nv12ComputeOutput::Rgba => include_bytes!("nv12.comp.spv"),
         Nv12ComputeOutput::YuvPlanes => include_bytes!("nv12_planes.comp.spv"),
     };
-    if !bytes.len().is_multiple_of(4) {
+    let (words, remainder) = bytes.as_chunks::<4>();
+    if !remainder.is_empty() {
         return Err("embedded NV12 compute shader has an invalid byte length".to_string());
     }
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
-        .collect())
+    Ok(words.iter().copied().map(u32::from_le_bytes).collect())
 }
 
 fn nv12_compute_source_span(

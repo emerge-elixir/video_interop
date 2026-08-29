@@ -2,6 +2,23 @@ use std::io;
 
 use thiserror::Error;
 
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum DmaBufAllocationSizeError {
+    #[error("failed to stat DMA-BUF fd: {0}")]
+    Stat(#[source] io::Error),
+    #[error("failed to query DMA-BUF allocation size: {0}")]
+    Seek(#[source] io::Error),
+    #[error("failed to restore DMA-BUF file position: {0}")]
+    Restore(#[source] io::Error),
+    #[error("DMA-BUF allocation size is zero")]
+    Zero,
+    #[error("DMA-BUF stat size is negative: {0}")]
+    NegativeStat(i64),
+    #[error("DMA-BUF size probes disagree: fstat={stat}, seek_end={seek_end}")]
+    ProbeMismatch { stat: u64, seek_end: u64 },
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ValidationError {
     #[error("coded frame size must be positive, got {width}x{height}")]
