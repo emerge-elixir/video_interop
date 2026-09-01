@@ -19,7 +19,7 @@ defmodule VideoInterop.Lease do
   The opaque backend token should provide an owner-crash destructor fallback. A producer may also
   attach a unique `VideoInterop.AbandonmentGuard` authority envelope to each holder. Its verified
   native resource destructor is an eventual fallback for a holder-bearing BEAM term that disappears
-  without an explicit release; normal release remains the deterministic primary path.
+  without an explicit release. Normal release remains the primary path.
   """
 
   alias VideoInterop.AbandonmentGuard

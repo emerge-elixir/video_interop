@@ -2,8 +2,8 @@ defmodule VideoInterop.DMABuf.FourCC do
   @moduledoc """
   Helpers for DRM fourcc values.
 
-  The canonical representation is the unsigned 32-bit integer used by DRM.
-  Four-character binaries are encoded in little-endian byte order.
+  VideoInterop stores the unsigned 32-bit integer used by DRM. Four-character
+  binaries are encoded in little-endian byte order.
   """
 
   import Bitwise

@@ -96,8 +96,7 @@ defmodule VideoInterop.LeaseOwner do
   owner can trap producer exit and outlive it until every lease drains.
   `release_retry` defaults to `:manual`. Automatic exponential retry requires an
   idempotent release callback. Before stopping after successful drainage, the
-  owner sends an immutable final-stats notification followed by the existing
-  two-field drained notification.
+  owner sends its final stats followed by the two-field drained notification.
   """
   @spec start_link([option()]) :: GenServer.on_start()
   def start_link(opts) do

@@ -2,43 +2,56 @@
 
 ## 0.1.0 - Unreleased
 
-- Add the framework-neutral `VideoInterop` Elixir frame, format, DMA-BUF,
-  sync-file, validation, and lease contracts.
-- Add the single `video-interop` Rust crate with optional Rustler schemas,
-  close-on-exec fd duplication, prepared/claimed lease ownership, and RAII
-  cleanup.
-- Add optional dynamically loaded EGL native sync-file fencing without mandatory EGL/GL linkage; reserve Vulkan for a later feature.
-- Add explicit caller-owned/transferred issue results, atomic drain waiters,
-  normalized retry errors, and optional single-flight exponential release retry.
-- Add frame-level retain and ownership-aware consumer/session protocols with
-  consuming open, transfer, and close helpers.
-- Add prototype-gated per-holder abandonment guards, transactional root/retain
-  construction, bounded release tombstones, honest late-release diagnostics,
-  distinct fallback accounting, and immutable final drain stats.
-- Authenticate producer-native guards through authority envelopes, preserve
-  them opaquely through Rust prepare/claim, and replace the detached static
-  worker with explicitly closed/joined lifecycle dispatchers whose destructors
-  remain nonblocking.
-- Add persistent direct packed Vulkan imports plus explicit bounded linear-buffer-to-optimal-BGRA
-  compute staging for devices that cannot sample producer-linear images.
-- Add bounded linear-buffer-to-optimal NV12 transfer staging with exact plane copy regions,
-  multi-planar sampler-YCbCr output where exact filtering exists, separate optimal Y/UV transfer
-  output otherwise, explicit external ownership return, and compute-planar rollback.
-- Separate the NV12 transfer buffer's exact copied-byte span from the complete imported allocation
-  size so truthful producer-owned V3DV read-ahead tails satisfy Vulkan memory requirements without
-  entering any copy region.
-- Isolate host-built Rust schema test NIFs under the ignored Cargo target directory so they
-  cannot leak into a Nerves target release through the application's `priv` directory.
-- Reserve finite lease capacity before the token-bearing issue commit, run backend release
-  callbacks on a monitored serial executor, normalize owner-death lifecycle calls, and keep
-  active-holder/oldest-lease statistics incremental.
-- Count dispatcher delivery to dead local owners separately from fatal worker/channel corruption.
-- Verify DMA-BUF allocation sizes against the fd, reject unreferenced descriptor objects, and bound
-  compute NV12 shader addressing to its logical 32-bit source span.
-- Expose the canonical fd-backed DMA-BUF allocation-size probe to producers so descriptor
-  publication and strict Vulkan import use identical `SEEK_END`/`fstat` semantics.
-- Bind Vulkan synchronization lanes to unique import identities, enforce renderer wait/release
-  ordering, route queue submission through renderer-owned authority, and quarantine uncertain drop.
-- Inventory and resolve multiple NV12 candidates per modifier, preserve forced fail-closed modes,
-  and cache direct NV12 imports alongside staged sources.
-- Add reproducible SPIR-V regeneration/validation and all-feature Vulkan CI coverage.
+First public release.
+
+### Frame contract
+
+- Add Elixir and Rust types for Linux DMA-BUF frames, layers, planes, modifiers,
+  visible geometry, color information, and sync-file acquire fences.
+- Validate descriptor bounds, object references, plane layout, stream format,
+  and DMA-BUF allocation sizes.
+- Duplicate retained file descriptors with `FD_CLOEXEC` and close owned copies
+  when their Rust values are dropped.
+- Keep timestamps in the transport rather than the frame descriptor.
+
+### Leases and consumers
+
+- Add `VideoInterop.LeaseOwner` for bounded frame leases, fan-out, producer
+  shutdown, draining, release callbacks, and optional release retry.
+- Report whether an issue error leaves the backend token with the caller or
+  transfers cleanup to the lease owner.
+- Add per-holder fallback guards for native producers that need cleanup when a
+  holder-bearing BEAM term disappears without release.
+- Add `VideoInterop.Consumer` and `VideoInterop.ConsumerSession` with helpers
+  that keep frame ownership clear on open, transfer, rejection, and close.
+- Add native prepared and claimed frame types backed by a release-dispatch
+  worker with a required lifecycle close.
+
+### Graphics helpers
+
+- Add dynamically loaded EGL native-fence creation, import, duplication, waits,
+  and polling without a link-time EGL or GL dependency.
+- Add an experimental Vulkan module for DMA-BUF capability checks, memory
+  import, sync-file waits, external queue ownership, release fences, and bounded
+  import caches.
+- Add fallback paths for linear NV12 and packed RGBA/BGRA when the producer
+  image cannot be sampled directly.
+- Keep image copy regions separate from allocation padding reported by the
+  DMA-BUF fd.
+
+### Packages and validation
+
+- Publish the `video_interop` Hex package without a bundled NIF. The package
+  includes the source for the `video-interop` crate.
+- Publish the same Rust source as the `video-interop` crate with optional
+  `rustler`, `egl`, and `vulkan` features.
+- Test the supported Elixir and Rust versions, all Rust features, generated Hex
+  and Cargo packages, and reproducible Vulkan shaders in CI.
+
+### Known limits
+
+- File descriptor integers are local to one OS process and cannot be sent to
+  another Erlang node.
+- Vulkan support is experimental until the pinned-RPi5 hardware matrix is
+  complete.
+- Metal and Direct3D adapters are not included.

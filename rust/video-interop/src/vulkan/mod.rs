@@ -1,8 +1,9 @@
-//! Optional Vulkan DMA-BUF import adapter.
+//! Experimental Vulkan DMA-BUF import adapter.
 //!
-//! This module owns generic DMA-BUF validation, external-memory import, active-device
-//! capability queries, and acquire/release synchronization. A renderer supplies an already
-//! selected Vulkan device and may wrap [`ImportedDmaBufImage::image`] in its own rendering API.
+//! The API may change while pinned V3DV hardware testing continues. The module provides DMA-BUF
+//! validation, external-memory import, device capability queries, and acquire/release
+//! synchronization. A renderer supplies an already selected Vulkan device and may wrap
+//! [`ImportedDmaBufImage::image`] in its own rendering API.
 
 mod capability;
 mod error;
@@ -90,7 +91,7 @@ const STAGED_NV12_OUTPUT_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_
         | vk::ImageUsageFlags::TRANSFER_SRC.as_raw()
         | vk::ImageUsageFlags::TRANSFER_DST.as_raw(),
 );
-// The optimal multi-planar destination is importer-owned and therefore may truthfully declare
+// The optimal multi-planar destination is importer-owned and may declare
 // Ganesh's transfer compatibility in addition to the transfer-destination operation that fills it.
 const TRANSFER_NV12_OUTPUT_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
     vk::ImageUsageFlags::SAMPLED.as_raw()
@@ -137,10 +138,15 @@ impl Default for VulkanImportPoolLimits {
 /// with the caller. Implementations must keep every returned handle alive for the lifetime of any
 /// importer or imported image.
 pub trait VulkanDeviceContext: Send + Sync + 'static {
+    /// Returns the instance that owns `physical_device`.
     fn instance(&self) -> &Instance;
+    /// Returns the physical device used for import capability checks.
     fn physical_device(&self) -> vk::PhysicalDevice;
+    /// Returns the logical device that owns every created import resource.
     fn device(&self) -> &Device;
+    /// Returns the queue used for acquire, conversion, and release submissions.
     fn queue(&self) -> vk::Queue;
+    /// Returns the family index of [`Self::queue`].
     fn queue_family_index(&self) -> u32;
 
     /// Submits through the renderer's single queue-host-access authority.
@@ -158,7 +164,9 @@ pub trait VulkanDeviceContext: Send + Sync + 'static {
         fence: vk::Fence,
     ) -> Result<(), vk::Result>;
 
+    /// Records that a Vulkan operation returned `ERROR_DEVICE_LOST`.
     fn mark_device_lost(&self);
+    /// Reports whether this context has observed device loss.
     fn is_device_lost(&self) -> bool;
 }
 

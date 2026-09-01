@@ -14,7 +14,7 @@ use super::{
 };
 
 /// DMA-BUF ownership outside this logical Vulkan device. The core external family is used rather
-/// than `FOREIGN_EXT`; producer and consumer must agree on this exact ownership identity.
+/// than `FOREIGN_EXT`; producer and consumer must use the same ownership identity.
 pub const DMA_BUF_EXTERNAL_QUEUE_FAMILY: u32 = vk::QUEUE_FAMILY_EXTERNAL;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,7 +87,7 @@ struct TimestampQuery {
 /// Direct images transition from external `GENERAL` to shader-read and back. Staged imports
 /// acquire the external source buffer, run the GPU copy/conversion, return the source buffer to the
 /// external family in the same submission, and expose only the internal sampled image to the
-/// renderer. The release fence always remains the sole canonical lease-retirement authority.
+/// renderer. The release fence is the only signal that permits lease retirement.
 pub struct ImportedImageSync<D: VulkanDeviceContext> {
     device: Arc<D>,
     acquire_pool: vk::CommandPool,
@@ -332,8 +332,8 @@ impl<D: VulkanDeviceContext> ImportedImageSync<D> {
         }
     }
 
-    /// Polls the exact staged conversion/source-release submission. A true result proves that the
-    /// producer DMA-BUF has been returned to the external queue family and its canonical lease may
+    /// Polls the staged conversion/source-release submission. A true result proves that the
+    /// producer DMA-BUF has been returned to the external queue family and its lease may
     /// retire even while the renderer-native output remains displayed.
     pub fn source_release_complete(&self) -> Result<bool, ImportedImageSyncError> {
         if !self.acquire_submitted {

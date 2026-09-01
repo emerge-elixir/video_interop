@@ -82,16 +82,15 @@ struct DispatcherState {
     joining: bool,
 }
 
-/// Lifecycle-owned dispatcher for deterministic and fallback lease messages.
+/// Lifecycle-owned dispatcher for normal and fallback lease messages.
 ///
 /// A producer or consumer owns the root Rustler resource. Prepared and claimed
-/// leases hold counted clients that pin the resource until deterministic
-/// release has been queued. Guards also pin the resource, but become inert
-/// after an exact lifecycle close so stale already-retired BEAM terms cannot
-/// keep shutdown waiting forever.
+/// leases hold counted clients that pin the resource until release has been
+/// queued. Guards also pin the resource, but become inert after lifecycle close
+/// so stale already-retired BEAM terms cannot keep shutdown waiting forever.
 ///
 /// The lifecycle owner must call [`ReleaseDispatcher::close_and_join`] from a
-/// dirty-I/O NIF after its exact holder/claim drain. Resource destructors never
+/// dirty-I/O NIF after every holder and claim drains. Resource destructors never
 /// wait or join. Dropping the last reference before an explicit join is fatal,
 /// because otherwise a worker could execute unloaded NIF code.
 pub struct ReleaseDispatcher {
@@ -408,7 +407,7 @@ impl Drop for DispatcherClient {
     }
 }
 
-/// Unique fallback resource attached to one canonical holder.
+/// Fallback resource attached to one lease holder.
 pub struct AbandonmentGuard {
     dispatcher: ResourceArc<ReleaseDispatcher>,
     command: Mutex<Option<DispatchCommand>>,
@@ -434,7 +433,7 @@ impl Drop for AbandonmentGuard {
 ///
 /// Guard creation is pre-publication and reports ordinary admission errors.
 /// Once returned to BEAM, enqueue loss while accepting is fatal lifecycle
-/// corruption. After exact lifecycle close, a stale guard is inert.
+/// corruption. After lifecycle close, a stale guard is inert.
 /// Returns whether a term is this producer NIF's registered guard resource.
 /// Producer authority callbacks should expose this constant-time check.
 pub fn is_abandonment_guard_resource(term: Term<'_>) -> bool {
@@ -543,7 +542,7 @@ impl PreparedVideoFrame {
         &self.frame
     }
 
-    /// Transfers deterministic release responsibility and the opaque guard
+    /// Transfers release responsibility and the opaque guard
     /// envelope to native code.
     pub fn claim(self) -> ClaimedVideoFrame {
         ClaimedVideoFrame {
@@ -564,7 +563,7 @@ impl ClaimedVideoFrame {
 }
 
 impl ClaimedLease {
-    /// Queues deterministic producer release. The guard envelope remains live
+    /// Queues producer release. The guard envelope remains live
     /// until the worker accepts the release command.
     pub fn retire(mut self) {
         self.dispatch_release();

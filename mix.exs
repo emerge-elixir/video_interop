@@ -9,6 +9,8 @@ defmodule VideoInterop.MixProject do
       version: @version,
       elixir: "~> 1.17",
       description: "Owned video frame descriptors, synchronization, and leases",
+      source_url: "https://github.com/emerge-elixir/video_interop",
+      homepage_url: "https://github.com/emerge-elixir/video_interop",
       elixirc_paths: elixirc_paths(Mix.env()),
       aliases: aliases(),
       package: package(),
@@ -106,6 +108,8 @@ defmodule VideoInterop.MixProject do
   defp docs do
     [
       main: "readme",
+      source_url: "https://github.com/emerge-elixir/video_interop",
+      source_ref: "v#{@version}",
       extras: ["README.md", "CHANGELOG.md", LICENSE: [title: "License"]]
     ]
   end

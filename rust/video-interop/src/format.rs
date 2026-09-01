@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-/// Numeric validation errors for the immutable stream format.
+/// Numeric validation errors for a stream format.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum FormatValidationError {
     #[error("stream format size must be positive, got {width}x{height}")]
@@ -13,10 +13,10 @@ pub enum FormatValidationError {
     InvalidPixelAspectRatio { numerator: u32, denominator: u32 },
 }
 
-/// Positive rational represented exactly as the Elixir `{numerator, denominator}` tuple.
+/// Positive rational represented as the Elixir `{numerator, denominator}` tuple.
 pub type Rational = (u32, u32);
 
-/// Immutable synchronization policy declared by `VideoInterop.Format`.
+/// Synchronization policy declared by `VideoInterop.Format`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[cfg_attr(feature = "rustler", derive(rustler::NifUnitEnum))]
 pub enum AcquireSyncPolicy {
@@ -25,7 +25,7 @@ pub enum AcquireSyncPolicy {
     PerFrame,
 }
 
-/// Immutable DMA-BUF modifier policy declared by `VideoInterop.DMABuf.Format`.
+/// DMA-BUF modifier policy declared by `VideoInterop.DMABuf.Format`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ModifierPolicy {
     PerBuffer,
@@ -133,7 +133,7 @@ pub enum AlphaMode {
     Premultiplied,
 }
 
-/// Exact Rust representation of `VideoInterop.Colorimetry`.
+/// Rust representation of `VideoInterop.Colorimetry`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[cfg_attr(feature = "rustler", derive(rustler::NifStruct))]
 #[cfg_attr(feature = "rustler", module = "VideoInterop.Colorimetry")]
@@ -157,7 +157,7 @@ impl Default for Colorimetry {
     }
 }
 
-/// Exact Rust representation of `VideoInterop.DMABuf.Format`.
+/// Rust representation of `VideoInterop.DMABuf.Format`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[cfg_attr(feature = "rustler", derive(rustler::NifStruct))]
 #[cfg_attr(feature = "rustler", module = "VideoInterop.DMABuf.Format")]
@@ -175,7 +175,7 @@ impl DmaBufFormat {
     }
 }
 
-/// Exact Rust representation of the immutable `VideoInterop.Format` stream schema.
+/// Rust representation of the `VideoInterop.Format` stream schema.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 #[cfg_attr(feature = "rustler", derive(rustler::NifStruct))]
 #[cfg_attr(feature = "rustler", module = "VideoInterop.Format")]
