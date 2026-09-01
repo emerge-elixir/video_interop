@@ -3,7 +3,7 @@ defmodule VideoInterop do
   Framework-neutral video frame interoperability contract.
 
   Version 0.1 describes Linux DMA-BUF storage, optional acquire sync-file
-  fences, deterministic producer leases, and ownership-aware consumer streams.
+  fences, producer leases, and ownership-aware consumer streams.
   File descriptor integers in Elixir are borrowed and local to one OS process.
   Native consumers must validate and duplicate every descriptor before retaining
   it asynchronously.
@@ -43,7 +43,7 @@ defmodule VideoInterop do
       true ->
         case validate(format) do
           :ok ->
-            if Consumer.impl_for(consumer) do
+            if protocol_implemented?(Consumer, consumer) do
               open_validated_consumer(consumer, format, Keyword.put(opts, :owner, owner))
             else
               {:error, {:unsupported_consumer, consumer}}
@@ -65,7 +65,7 @@ defmodule VideoInterop do
   """
   @spec consume(ConsumerSession.t(), Frame.t()) :: :ok | {:error, term()}
   def consume(session, %Frame{} = frame) do
-    if ConsumerSession.impl_for(session) do
+    if protocol_implemented?(ConsumerSession, session) do
       case invoke_consumer!(:transfer, fn ->
              apply(ConsumerSession, :transfer, [session, frame])
            end) do
@@ -91,7 +91,7 @@ defmodule VideoInterop do
   defp open_validated_consumer(consumer, format, opts) do
     case invoke_consumer!(:open, fn -> apply(Consumer, :open, [consumer, format, opts]) end) do
       {:ok, session} = opened ->
-        if ConsumerSession.impl_for(session) do
+        if protocol_implemented?(ConsumerSession, session) do
           opened
         else
           raise ConsumerContractError,
@@ -110,7 +110,7 @@ defmodule VideoInterop do
   @doc "Closes a consumer session with its implementation's idempotent close operation."
   @spec close_consumer(ConsumerSession.t()) :: :ok
   def close_consumer(session) do
-    if ConsumerSession.impl_for(session) do
+    if protocol_implemented?(ConsumerSession, session) do
       case invoke_consumer!(:close, fn -> apply(ConsumerSession, :close, [session]) end) do
         :ok -> :ok
         other -> raise ConsumerContractError, operation: :close, result: other
@@ -120,6 +120,10 @@ defmodule VideoInterop do
         operation: :close,
         result: {:unsupported_consumer_session, session}
     end
+  end
+
+  defp protocol_implemented?(protocol, value) do
+    not is_nil(apply(protocol, :impl_for, [value]))
   end
 
   defp invoke_consumer!(operation, function) do

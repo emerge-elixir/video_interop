@@ -18,8 +18,8 @@ pub(crate) struct DmaBufProbe {
 
 /// Returns the complete allocation size exposed by a DMA-BUF fd.
 ///
-/// This is not a visible image or plane span. Exporters may include real alignment padding after
-/// the final addressable plane byte, and canonical descriptors must publish that complete size.
+/// This is not a visible image or plane span. Exporters may include alignment padding after the
+/// final addressable plane byte. A descriptor must report the complete size returned by the fd.
 pub fn dmabuf_allocation_size(fd: RawFd) -> Result<u64, DmaBufAllocationSizeError> {
     probe_dmabuf(fd).map(|probe| probe.allocation_size)
 }
@@ -336,9 +336,8 @@ mod rustler_impl {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
     use std::io;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     use super::{Descriptor, Layer, Modifier, Object, Plane, dmabuf_allocation_size};
     use crate::{DmaBufAllocationSizeError, duplicate_fd_cloexec};
@@ -395,17 +394,26 @@ mod tests {
 
     #[test]
     fn closes_earlier_duplicates_when_a_later_duplicate_fails() {
-        let source = File::open("/dev/null").expect("open /dev/null");
+        let mut pipe = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        // SAFETY: pipe2 returned two owned descriptors.
+        let read = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+        // SAFETY: pipe2 returned two owned descriptors.
+        let write = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+
         let descriptor = Descriptor {
             version: 1,
             objects: vec![
                 Object {
-                    fd: source.as_raw_fd(),
+                    fd: write.as_raw_fd(),
                     size: 4096,
                     modifier: Modifier::Implicit,
                 },
                 Object {
-                    fd: source.as_raw_fd(),
+                    fd: write.as_raw_fd(),
                     size: 4096,
                     modifier: Modifier::Implicit,
                 },
@@ -428,22 +436,26 @@ mod tests {
         };
 
         let mut calls = 0;
-        let mut first_duplicate: Option<RawFd> = None;
         let result = descriptor.duplicate_with(|fd| {
             calls += 1;
             if calls == 2 {
-                return Err(io::Error::other("injected duplicate failure"));
+                Err(io::Error::other("injected duplicate failure"))
+            } else {
+                duplicate_fd_cloexec(fd)
             }
-
-            let owned = duplicate_fd_cloexec(fd)?;
-            first_duplicate = Some(owned.as_raw_fd());
-            Ok(owned)
         });
 
         assert!(result.is_err());
-        let duplicated = first_duplicate.expect("first duplicate");
-        // SAFETY: F_GETFD only observes whether the recorded descriptor remains open.
-        assert_eq!(unsafe { libc::fcntl(duplicated, libc::F_GETFD) }, -1);
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        assert_eq!(calls, 2);
+        drop(write);
+
+        let mut byte = 0_u8;
+        // SAFETY: read points to one writable byte and the pipe read descriptor is still owned.
+        let read_count =
+            unsafe { libc::read(read.as_raw_fd(), std::ptr::addr_of_mut!(byte).cast(), 1) };
+        assert_eq!(
+            read_count, 0,
+            "the failed operation leaked a duplicated write fd"
+        );
     }
 }
