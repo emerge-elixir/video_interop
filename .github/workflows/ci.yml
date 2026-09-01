@@ -4,8 +4,35 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   elixir:
+    name: Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - elixir: "1.17"
+            otp: "27"
+          - elixir: "1.20"
+            otp: "29"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp }}
+          elixir-version: ${{ matrix.elixir }}
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - run: mix deps.get
+      - run: mix format --check-formatted
+      - run: mix compile --force --warnings-as-errors
+      - run: mix test
+
+  docs-and-hex-package:
+    name: Documentation and Hex package
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -15,29 +42,68 @@ jobs:
           elixir-version: "1.20"
       - uses: dtolnay/rust-toolchain@1.91.0
       - run: mix deps.get
-      - run: mix format --check-formatted
-      - run: mix test
-      - run: mix hex.build
+      - run: mix compile --force --warnings-as-errors
+      - run: mix docs --warnings-as-errors
+      - name: Build and compile the unpacked Hex package
+        run: |
+          package_dir="$RUNNER_TEMP/video_interop-0.1.0"
+          mix hex.build --unpack --output "$package_dir"
+          (
+            cd "$package_dir"
+            MIX_ENV=prod mix compile --force --warnings-as-errors
+          )
+          cargo build \
+            --manifest-path "$package_dir/rust/video-interop/Cargo.toml" \
+            --all-features
+          cargo build \
+            --manifest-path "$package_dir/rust/video-interop/Cargo.toml" \
+            --release \
+            --all-features
+          cargo test \
+            --manifest-path "$package_dir/rust/video-interop/Cargo.toml" \
+            --no-default-features
+          cargo test \
+            --manifest-path "$package_dir/rust/video-interop/Cargo.toml" \
+            --all-features
+      - run: scripts/check-release-artifact-parity.sh
 
   rust:
+    name: Rust ${{ matrix.rust }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.91.0", "stable"]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
+      - run: cargo build --workspace --all-targets --all-features
+      - run: cargo build --release --workspace --all-targets --all-features
       - run: cargo test --workspace
+      - run: cargo test --workspace --all-features
       - run: cargo test -p video-interop --no-default-features
       - run: cargo test -p video-interop --no-default-features --features egl
       - run: cargo test -p video-interop --no-default-features --features vulkan
-      - run: cargo test --workspace --all-features
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo clippy -p video-interop --no-default-features --all-targets -- -D warnings
       - run: cargo clippy -p video-interop --no-default-features --features egl --all-targets -- -D warnings
       - run: cargo clippy -p video-interop --no-default-features --features vulkan --all-targets -- -D warnings
-      - run: cargo package -p video-interop --allow-dirty
-      - run: cargo test --manifest-path target/package/video-interop-0.1.0/Cargo.toml --no-default-features --features vulkan
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc -p video-interop --all-features --no-deps
+      - name: Build and test the Cargo package
+        if: matrix.rust == '1.91.0'
+        run: |
+          cargo package -p video-interop
+          cargo test \
+            --manifest-path target/package/video-interop-0.1.0/Cargo.toml \
+            --no-default-features
+          cargo test \
+            --manifest-path target/package/video-interop-0.1.0/Cargo.toml \
+            --no-default-features \
+            --features vulkan
 
   shaders:
     runs-on: ubuntu-latest
@@ -60,3 +126,19 @@ jobs:
         env:
           VIDEO_INTEROP_REQUIRE_PINNED_SHADER_TOOLS: "1"
         run: scripts/check-vulkan-shaders.sh
+
+  release-tag:
+    name: Release tag
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [elixir, docs-and-hex-package, rust, shaders]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify tag, package versions, and changelog date
+        run: |
+          crate_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' rust/video-interop/Cargo.toml | head -n 1)"
+          mix_version="$(sed -n 's/^  @version "\([^"]*\)"/\1/p' mix.exs)"
+          test -n "$crate_version"
+          test "$crate_version" = "$mix_version"
+          test "$GITHUB_REF_NAME" = "v$crate_version"
+          grep -Eq "^## $crate_version - [0-9]{4}-[0-9]{2}-[0-9]{2}$" CHANGELOG.md
