@@ -2,11 +2,12 @@ defmodule VideoInterop do
   @moduledoc """
   Framework-neutral video frame interoperability contract.
 
-  Version 0.1 describes Linux DMA-BUF storage, optional acquire sync-file
-  fences, producer leases, and ownership-aware consumer streams.
-  File descriptor integers in Elixir are borrowed and local to one OS process.
-  Native consumers must validate and duplicate every descriptor before retaining
-  it asynchronously.
+  Version 0.1 describes owned BEAM binary storage, borrowed Linux DMA-BUF
+  storage, optional acquire sync-file fences, producer leases, and
+  ownership-aware consumer streams. Binary frames use implicit synchronization
+  and no lease. File descriptor integers in Elixir are borrowed and local to one
+  OS process. Native consumers must validate and duplicate every descriptor
+  before retaining it asynchronously.
   """
 
   alias VideoInterop.{Consumer, ConsumerContractError, ConsumerSession, Format, Frame, Lease}
@@ -14,7 +15,10 @@ defmodule VideoInterop do
   alias VideoInterop.Validator
 
   @spec retain(Frame.t(), timeout()) :: {:ok, Frame.t()} | {:error, term()}
-  def retain(%Frame{lease: lease} = frame, timeout \\ 5_000) do
+  def retain(frame, timeout \\ 5_000)
+  def retain(%Frame{lease: nil} = frame, _timeout), do: {:ok, frame}
+
+  def retain(%Frame{lease: %Lease{} = lease} = frame, timeout) do
     case Lease.retain(lease, timeout) do
       {:ok, child_lease} -> {:ok, %{frame | lease: child_lease}}
       {:error, reason} -> {:error, reason}
@@ -22,7 +26,8 @@ defmodule VideoInterop do
   end
 
   @spec release(Frame.t() | Lease.t()) :: :ok
-  def release(%Frame{lease: lease}), do: Lease.release(lease)
+  def release(%Frame{lease: nil}), do: :ok
+  def release(%Frame{lease: %Lease{} = lease}), do: Lease.release(lease)
   def release(%Lease{} = lease), do: Lease.release(lease)
 
   @doc """

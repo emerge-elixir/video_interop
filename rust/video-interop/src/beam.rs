@@ -11,7 +11,7 @@ use rustler::types::reference::Reference;
 use rustler::{Encoder, LocalPid, NifStruct, Resource, ResourceArc, Term};
 
 use crate::{
-    AcquireSync, DispatcherError, FrameDescriptor, OwnedFrame, PrepareError, Rect, Storage,
+    AcquireSync, DispatcherError, Format, FrameDescriptor, OwnedFrame, PrepareError, Rect, Storage,
 };
 
 mod atoms {
@@ -41,9 +41,10 @@ pub struct Frame<'a> {
     pub coded_width: u32,
     pub coded_height: u32,
     pub visible_rect: Rect,
+    pub format: Option<Format>,
     pub storage: Storage,
     pub acquire_sync: AcquireSync,
-    pub lease: Lease<'a>,
+    pub lease: Option<Lease<'a>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -473,12 +474,12 @@ pub struct ClaimedLease {
 
 pub struct PreparedVideoFrame {
     frame: OwnedFrame,
-    lease: PreparedLease,
+    lease: Option<PreparedLease>,
 }
 
 pub struct ClaimedVideoFrame {
     pub frame: OwnedFrame,
-    pub lease: ClaimedLease,
+    pub lease: Option<ClaimedLease>,
 }
 
 struct GuardKeepalive {
@@ -510,17 +511,27 @@ impl Lease<'_> {
 }
 
 impl Frame<'_> {
-    /// Validates and duplicates all borrowed fds while leaving lease release
-    /// ownership with the Elixir caller.
+    /// Validates and owns the frame storage while leaving any lease release
+    /// ownership with the Elixir caller. Binary bytes are copied; borrowed file
+    /// descriptors are duplicated with `CLOEXEC`.
     ///
-    /// The entire abandonment authority envelope is saved opaquely. Call
-    /// [`PreparedVideoFrame::claim`] only after the native subsystem has
-    /// accepted responsibility for eventual retirement.
+    /// For borrowed storage, the entire abandonment authority envelope is saved
+    /// opaquely. Call [`PreparedVideoFrame::claim`] only after the native
+    /// subsystem has accepted responsibility for eventual retirement. Owned
+    /// binary storage has no lease to transfer.
     pub fn prepare_cloexec(
         &self,
         dispatcher: &ResourceArc<ReleaseDispatcher>,
     ) -> Result<PreparedVideoFrame, PrepareError> {
-        let client = ReleaseDispatcher::acquire_client(dispatcher)?;
+        let lease = match (&self.storage, &self.lease) {
+            (Storage::Binary(_), None) => None,
+            (Storage::Binary(_), Some(_)) => return Err(PrepareError::UnexpectedLease),
+            (Storage::DmaBuf(_), None) => return Err(PrepareError::MissingLease),
+            (Storage::DmaBuf(_), Some(lease)) => {
+                let client = ReleaseDispatcher::acquire_client(dispatcher)?;
+                Some(lease.prepare(client))
+            }
+        };
 
         let descriptor = FrameDescriptor {
             coded_width: self.coded_width,
@@ -531,8 +542,6 @@ impl Frame<'_> {
         };
 
         let frame = descriptor.duplicate_cloexec()?;
-        let lease = self.lease.prepare(client);
-
         Ok(PreparedVideoFrame { frame, lease })
     }
 }
@@ -547,17 +556,17 @@ impl PreparedVideoFrame {
     pub fn claim(self) -> ClaimedVideoFrame {
         ClaimedVideoFrame {
             frame: self.frame,
-            lease: ClaimedLease {
-                command: Some(self.lease.command),
-                guard: Some(self.lease.guard),
-                client: Some(self.lease.client),
-            },
+            lease: self.lease.map(|lease| ClaimedLease {
+                command: Some(lease.command),
+                guard: Some(lease.guard),
+                client: Some(lease.client),
+            }),
         }
     }
 }
 
 impl ClaimedVideoFrame {
-    pub fn into_parts(self) -> (OwnedFrame, ClaimedLease) {
+    pub fn into_parts(self) -> (OwnedFrame, Option<ClaimedLease>) {
         (self.frame, self.lease)
     }
 }

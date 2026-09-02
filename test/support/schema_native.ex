@@ -10,6 +10,7 @@ defmodule VideoInterop.SchemaNative do
 
   def inspect_descriptor(_descriptor), do: :erlang.nif_error(:nif_not_loaded)
   def inspect_frame(_frame), do: :erlang.nif_error(:nif_not_loaded)
+  def inspect_binary_frame(_frame), do: :erlang.nif_error(:nif_not_loaded)
   def round_trip_format(_format), do: :erlang.nif_error(:nif_not_loaded)
   def round_trip_colorimetry(_colorimetry), do: :erlang.nif_error(:nif_not_loaded)
   def start_dispatcher(), do: :erlang.nif_error(:nif_not_loaded)

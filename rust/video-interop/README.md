@@ -1,10 +1,10 @@
 # video-interop
 
-`video-interop` provides Rust types for borrowed Linux video frames.
+`video-interop` provides Rust types for owned binary and borrowed Linux video frames.
 
-It describes DMA-BUF objects, image planes, sync-file acquire fences, frame
-geometry, and stream format. Optional modules connect those types to Rustler,
-EGL, and Vulkan.
+It describes binary bytes and strides, DMA-BUF objects and planes, sync-file
+acquire fences, frame geometry, and stream formats. Optional modules connect
+those types to Rustler, EGL, and Vulkan.
 
 The crate does not allocate buffers, create a renderer, or choose a streaming
 framework.
@@ -39,6 +39,12 @@ video-interop = { version = "0.1", features = ["egl"] }
 video-interop = { version = "0.1", features = ["vulkan"] }
 ```
 
+## Binary storage
+
+`BinaryStorage` owns its bytes and plane metadata. Cloning or decoding it copies
+the bytes, so it needs neither file-descriptor duplication nor a release lease.
+Binary formats include RGBA8888, RGB888, Gray8, Gray2, and BW1.
+
 ## DMA-BUF ownership
 
 `Descriptor` contains borrowed integer file descriptors. Validate it before use.
@@ -56,15 +62,18 @@ into an owned frame.
 
 ## Rustler frames and leases
 
-The default feature maps the Rust types to the structs in the `video_interop`
-Hex package. It also provides prepared and claimed frames.
+The default feature maps both storage kinds to the structs in the
+`video_interop` Hex package. It also provides prepared and claimed frames for
+moving either storage kind into native queues.
 
-`Frame::prepare_cloexec` validates a frame and duplicates its descriptors. If a
-prepared frame is dropped, the descriptors close but lease ownership stays with
-the Elixir caller.
+`Frame::prepare_cloexec` validates a frame. It copies owned binary bytes without
+acquiring a lease client and duplicates borrowed descriptors with `CLOEXEC`. If
+a prepared borrowed frame is dropped, the descriptors close but lease ownership
+stays with the Elixir caller.
 
-`PreparedVideoFrame::claim` moves lease release responsibility to native code.
-Dropping `ClaimedVideoFrame` or `ClaimedLease` sends the release through a
+`PreparedVideoFrame::claim` moves any lease release responsibility to native
+code. Owned binary claims carry no lease. Dropping a borrowed
+`ClaimedVideoFrame` or `ClaimedLease` sends the release through a
 `ReleaseDispatcher`.
 
 The NIF lifecycle owner must call `ReleaseDispatcher::close_and_join` from a

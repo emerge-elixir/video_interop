@@ -9,6 +9,14 @@ pub enum FormatValidationError {
     InvalidFramerate { numerator: u32, denominator: u32 },
     #[error("stream format has invalid DRM fourcc 0")]
     InvalidFourcc,
+    #[error("BW1 binary format requires a polarity")]
+    MissingBw1Polarity,
+    #[error("BW1 polarity is only valid for BW1 binary format")]
+    UnexpectedBw1Polarity,
+    #[error("binary storage format requires implicit synchronization")]
+    BinaryFormatRequiresImplicitSync,
+    #[error("binary formats without alpha require opaque alpha mode")]
+    BinaryFormatRequiresOpaqueAlpha,
     #[error("pixel aspect ratio must be positive, got {numerator}/{denominator}")]
     InvalidPixelAspectRatio { numerator: u32, denominator: u32 },
 }
@@ -157,6 +165,42 @@ impl Default for Colorimetry {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(feature = "rustler", derive(rustler::NifUnitEnum))]
+pub enum BinaryPixelFormat {
+    Rgba8888,
+    Rgb888,
+    Gray8,
+    Gray2,
+    Bw1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(feature = "rustler", derive(rustler::NifUnitEnum))]
+pub enum Bw1Polarity {
+    OneIsBlack,
+    OneIsWhite,
+}
+
+/// Rust representation of `VideoInterop.Binary.Format`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(feature = "rustler", derive(rustler::NifStruct))]
+#[cfg_attr(feature = "rustler", module = "VideoInterop.Binary.Format")]
+pub struct BinaryFormat {
+    pub pixel_format: BinaryPixelFormat,
+    pub bw1_polarity: Option<Bw1Polarity>,
+}
+
+impl BinaryFormat {
+    pub fn validate(&self) -> Result<(), FormatValidationError> {
+        match (self.pixel_format, self.bw1_polarity) {
+            (BinaryPixelFormat::Bw1, None) => Err(FormatValidationError::MissingBw1Polarity),
+            (BinaryPixelFormat::Bw1, Some(_)) | (_, None) => Ok(()),
+            (_, Some(_)) => Err(FormatValidationError::UnexpectedBw1Polarity),
+        }
+    }
+}
+
 /// Rust representation of `VideoInterop.DMABuf.Format`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[cfg_attr(feature = "rustler", derive(rustler::NifStruct))]
@@ -175,6 +219,21 @@ impl DmaBufFormat {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum StorageFormat {
+    Binary(BinaryFormat),
+    DmaBuf(DmaBufFormat),
+}
+
+impl StorageFormat {
+    pub fn validate(&self) -> Result<(), FormatValidationError> {
+        match self {
+            Self::Binary(format) => format.validate(),
+            Self::DmaBuf(format) => format.validate(),
+        }
+    }
+}
+
 /// Rust representation of the `VideoInterop.Format` stream schema.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 #[cfg_attr(feature = "rustler", derive(rustler::NifStruct))]
@@ -183,7 +242,7 @@ pub struct Format {
     pub width: u32,
     pub height: u32,
     pub framerate: Option<Rational>,
-    pub storage: DmaBufFormat,
+    pub storage: StorageFormat,
     pub acquire_sync: AcquireSyncPolicy,
     pub colorimetry: Colorimetry,
     pub pixel_aspect_ratio: Rational,
@@ -213,6 +272,16 @@ impl Format {
         }
 
         self.storage.validate()?;
+        if let StorageFormat::Binary(storage) = self.storage {
+            if self.acquire_sync != AcquireSyncPolicy::Implicit {
+                return Err(FormatValidationError::BinaryFormatRequiresImplicitSync);
+            }
+            if storage.pixel_format != BinaryPixelFormat::Rgba8888
+                && self.alpha_mode != AlphaMode::Opaque
+            {
+                return Err(FormatValidationError::BinaryFormatRequiresOpaqueAlpha);
+            }
+        }
 
         let (numerator, denominator) = self.pixel_aspect_ratio;
         if numerator == 0 || denominator == 0 {
@@ -230,7 +299,7 @@ impl Format {
 mod rustler_impl {
     use rustler::{Decoder, Encoder, Env, Error, NifResult, Term};
 
-    use super::ModifierPolicy;
+    use super::{BinaryFormat, DmaBufFormat, ModifierPolicy, StorageFormat};
 
     mod atoms {
         rustler::atoms! {
@@ -255,6 +324,24 @@ mod rustler_impl {
         }
     }
 
+    impl<'a> Decoder<'a> for StorageFormat {
+        fn decode(term: Term<'a>) -> NifResult<Self> {
+            if let Ok(format) = term.decode::<DmaBufFormat>() {
+                return Ok(Self::DmaBuf(format));
+            }
+            term.decode::<BinaryFormat>().map(Self::Binary)
+        }
+    }
+
+    impl Encoder for StorageFormat {
+        fn encode<'a>(&self, env: Env<'a>) -> Term<'a> {
+            match self {
+                Self::Binary(format) => format.encode(env),
+                Self::DmaBuf(format) => format.encode(env),
+            }
+        }
+    }
+
     impl Encoder for ModifierPolicy {
         fn encode<'a>(&self, env: Env<'a>) -> Term<'a> {
             match self {
@@ -275,10 +362,10 @@ mod tests {
             width: 640,
             height: 480,
             framerate: Some((60, 1)),
-            storage: DmaBufFormat {
+            storage: StorageFormat::DmaBuf(DmaBufFormat {
                 fourcc: u32::from_le_bytes(*b"NV12"),
                 modifier: ModifierPolicy::PerBuffer,
-            },
+            }),
             acquire_sync: AcquireSyncPolicy::PerFrame,
             colorimetry: Colorimetry::default(),
             pixel_aspect_ratio: (1, 1),
@@ -301,11 +388,34 @@ mod tests {
                 AcquireSyncPolicy::PerFrame,
             ] {
                 let mut candidate = format();
-                candidate.storage.modifier = modifier;
+                let StorageFormat::DmaBuf(storage) = &mut candidate.storage else {
+                    unreachable!()
+                };
+                storage.modifier = modifier;
                 candidate.acquire_sync = acquire_sync;
                 assert_eq!(candidate.validate(), Ok(()));
             }
         }
+    }
+
+    #[test]
+    fn binary_formats_require_implicit_synchronization() {
+        let mut candidate = format();
+        candidate.storage = StorageFormat::Binary(BinaryFormat {
+            pixel_format: BinaryPixelFormat::Gray8,
+            bw1_polarity: None,
+        });
+        assert_eq!(
+            candidate.validate(),
+            Err(FormatValidationError::BinaryFormatRequiresImplicitSync)
+        );
+        candidate.acquire_sync = AcquireSyncPolicy::Implicit;
+        assert_eq!(candidate.validate(), Ok(()));
+        candidate.alpha_mode = AlphaMode::Straight;
+        assert_eq!(
+            candidate.validate(),
+            Err(FormatValidationError::BinaryFormatRequiresOpaqueAlpha)
+        );
     }
 
     #[test]
@@ -418,7 +528,10 @@ mod tests {
         );
 
         let mut candidate = format();
-        candidate.storage.fourcc = 0;
+        let StorageFormat::DmaBuf(storage) = &mut candidate.storage else {
+            unreachable!()
+        };
+        storage.fourcc = 0;
         assert_eq!(
             candidate.validate(),
             Err(FormatValidationError::InvalidFourcc)

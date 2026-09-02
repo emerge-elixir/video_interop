@@ -22,6 +22,43 @@ defmodule VideoInterop.RustSchemaTest do
              {:ok, {640, 480, 640, 480, true, true, false}}
   end
 
+  test "Rustler decodes owned binary storage without a lease" do
+    frame =
+      Frame.binary(<<1, 2, 3, 4, 5, 6, 7, 8, 9, 10>>,
+        width: 1,
+        height: 2,
+        stride: 6,
+        pixel_format: :rgba8888
+      )
+
+    assert SchemaNative.inspect_binary_frame(frame) ==
+             {:ok, {1, 2, 10, 0, 6, true, true}}
+  end
+
+  test "native preparation accepts owned binary frames without lease clients" do
+    assert {:ok, {dispatcher, _probe}} = SchemaNative.start_dispatcher()
+
+    frame =
+      Frame.binary(<<1, 2, 3, 4>>, width: 1, height: 1, pixel_format: :rgba8888)
+
+    assert SchemaNative.claim_and_drop_frame(frame, dispatcher) == {:ok, true}
+    assert SchemaNative.shutdown_dispatcher(dispatcher) == {:ok, true}
+  end
+
+  test "native preparation rejects leases on owned binary frames" do
+    assert {:ok, {dispatcher, _probe}} = SchemaNative.start_dispatcher()
+
+    frame =
+      Frame.binary(<<1, 2, 3, 4>>, width: 1, height: 1, pixel_format: :rgba8888)
+
+    assert SchemaNative.claim_and_drop_frame(
+             %{frame | lease: Lease.new(self(), make_ref())},
+             dispatcher
+           ) == {:error, "owned binary video frame storage must not carry a lease"}
+
+    assert SchemaNative.shutdown_dispatcher(dispatcher) == {:ok, true}
+  end
+
   test "Rustler rejects oversized AVDRM lists before decoding all entries" do
     descriptor = descriptor(10)
     [object] = descriptor.objects

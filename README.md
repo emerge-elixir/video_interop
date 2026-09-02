@@ -5,22 +5,23 @@
 [![crates.io](https://img.shields.io/crates/v/video-interop.svg)](https://crates.io/crates/video-interop)
 [![CI](https://github.com/emerge-elixir/video_interop/actions/workflows/ci.yml/badge.svg)](https://github.com/emerge-elixir/video_interop/actions/workflows/ci.yml)
 
-VideoInterop describes a borrowed video frame as plain Elixir and Rust data.
+VideoInterop describes owned and borrowed video frames as plain Elixir and Rust data.
 
-A producer can use it to hand a DMA-BUF frame to a renderer or another native
-consumer without tying either side to a streaming framework. The frame carries
-its storage layout, synchronization information, and a lease that tells the
-producer when the consumer is finished.
+A producer can hand an immutable BEAM binary or a Linux DMA-BUF to a renderer or
+another native consumer without tying either side to a streaming framework.
+Owned binaries need no lease. Borrowed storage carries synchronization metadata
+and a lease that tells the producer when the consumer is finished.
 
 VideoInterop does not allocate buffers, initialize a graphics API, render, or
 choose how frames travel through an application.
 
 ## Project status
 
-Version 0.1 supports Linux DMA-BUF frames and sync-file acquire fences.
+Version 0.1 supports owned RGBA8888, RGB888, Gray8, Gray2, and BW1 binaries,
+plus Linux DMA-BUF frames and sync-file acquire fences.
 
-The frame, validation, lease, Rustler, and EGL APIs are the supported 0.1
-contract. The Vulkan module is experimental. Its API may change while hardware
+The frame, binary, DMA-BUF, validation, lease, Rustler, and EGL APIs are the
+supported 0.1 contract. The Vulkan module is experimental. Its API may change while hardware
 testing on V3DV continues.
 
 File descriptor integers are only useful inside one operating-system process.
@@ -53,7 +54,30 @@ off:
 video-interop = { version = "0.1", default-features = false }
 ```
 
-## Describing a frame
+## Describing an owned frame
+
+Use `VideoInterop.Frame.binary/2` for immutable BEAM data:
+
+```elixir
+frame =
+  VideoInterop.Frame.binary(rgba,
+    width: 640,
+    height: 480,
+    pixel_format: :rgba8888,
+    framerate: {30, 1}
+  )
+
+:ok = VideoInterop.validate(frame)
+:ok = VideoInterop.release(frame)
+```
+
+The binary is owned by the frame term, synchronization is implicit, and
+`release/1` is a no-op. RGBA8888 defaults to premultiplied alpha; pass
+`alpha_mode: :straight` for ordinary straight-alpha bytes. Packed Gray2 and BW1
+rows are MSB-first and independently
+strided. BW1 also requires `bw1_polarity: :one_is_black` or `:one_is_white`.
+
+## Describing a borrowed frame
 
 Here is a small NV12 frame backed by one DMA-BUF object:
 
@@ -124,9 +148,10 @@ If a consumer raises or returns a result that does not say who owns the frame,
 `close_consumer/1` stops new transfers. A session implementation must also
 finish or schedule the release of frames it already accepted.
 
-## Leases
+## Leases for borrowed storage
 
-A lease gives one holder the right to use a producer buffer. Release tells the
+A lease gives one holder the right to use a producer buffer. Binary frames do
+not use leases. Release tells the
 producer that holder is finished.
 
 Use one `VideoInterop.LeaseOwner` for each producer or native buffer pool:
@@ -168,9 +193,10 @@ for retry, shutdown, and abandonment fallback behavior.
 
 ## Using a frame from Rust
 
-The default `rustler` feature decodes the Elixir frame and format structs. A
-native consumer should duplicate file descriptors before keeping a frame after
-the NIF call returns.
+The default `rustler` feature decodes binary and DMA-BUF frame and format
+structs. Binary storage decodes into owned bytes. A native consumer must
+duplicate borrowed file descriptors before keeping a DMA-BUF frame after the
+NIF call returns.
 
 ```rust
 use rustler::ResourceArc;
@@ -191,9 +217,10 @@ fn accept(
 }
 ```
 
-Dropping a prepared frame closes its duplicated descriptors but leaves the lease
-with the Elixir caller. Claiming the frame moves release responsibility to
-native code.
+Preparing an owned binary frame copies its bytes and does not acquire a lease
+client. Preparing borrowed storage duplicates its descriptors but leaves the
+lease with the Elixir caller. Claiming a borrowed frame moves release
+responsibility to native code; claiming an owned frame carries no lease.
 
 A lifecycle owner must call `ReleaseDispatcher::close_and_join` from a dirty I/O
 NIF after all native claims have drained. Destructors do not wait for the worker

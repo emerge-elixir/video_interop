@@ -1,7 +1,9 @@
 # Membrane Video Interop Migration
 
-Status: base transport adapter and generic ownership/consumer hardening
-implemented; reusable consumer sink and downstream migration remain.
+Status: Superseded by the completed standalone transport design. Current
+integration uses `Membrane.VideoInterop.Source` and `Sink`, atom video targets,
+and `Emerge.submit_video_frame/3`; direct Emerge connection details below are
+retained as historical context only.
 
 ## Goal
 

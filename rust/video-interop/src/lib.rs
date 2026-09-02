@@ -22,11 +22,12 @@ pub use dmabuf::{
 };
 pub use error::{DmaBufAllocationSizeError, DuplicateError, ValidationError};
 pub use format::{
-    AcquireSyncPolicy, AlphaMode, ChromaLocation, ColorRange, Colorimetry, DmaBufFormat, Format,
-    FormatValidationError, InterlaceMode, Matrix, ModifierPolicy, Primaries, Rational,
-    StreamAcquireSyncPolicy, StreamModifierPolicy, Transfer,
+    AcquireSyncPolicy, AlphaMode, BinaryFormat, BinaryPixelFormat, Bw1Polarity, ChromaLocation,
+    ColorRange, Colorimetry, DmaBufFormat, Format, FormatValidationError, InterlaceMode, Matrix,
+    ModifierPolicy, Primaries, Rational, StorageFormat, StreamAcquireSyncPolicy,
+    StreamModifierPolicy, Transfer,
 };
-pub use frame::{FrameDescriptor, OwnedFrame, OwnedStorage, Storage};
+pub use frame::{BinaryPlane, BinaryStorage, FrameDescriptor, OwnedFrame, OwnedStorage, Storage};
 pub use geometry::Rect;
 pub use modifier::Modifier;
 pub use sync_file::{AcquireSync, OwnedAcquireSync, SyncFile};

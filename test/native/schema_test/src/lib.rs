@@ -39,6 +39,7 @@ impl Resource for NativeClaim {}
 
 type DescriptorSummary = (u32, usize, usize, u32, Option<u64>, usize);
 type FrameSummary = (u32, u32, u32, u32, bool, bool, bool);
+type BinaryFrameSummary = (u32, u32, usize, u64, u32, bool, bool);
 
 #[rustler::nif]
 fn inspect_descriptor(descriptor: Descriptor) -> Result<DescriptorSummary, String> {
@@ -75,14 +76,49 @@ fn inspect_frame(frame: Frame<'_>) -> Result<FrameSummary, String> {
         .first()
         .is_some_and(|object| matches!(object.modifier, Modifier::Explicit(0)));
 
+    let lease = frame
+        .lease
+        .as_ref()
+        .ok_or_else(|| "DMA-BUF frame has no lease".to_string())?;
+
     Ok((
         frame.coded_width,
         frame.coded_height,
         frame.visible_rect.width,
         frame.visible_rect.height,
         matches!(frame.acquire_sync, AcquireSync::SyncFile(_)),
-        frame.lease.token.is_ref() && modifier_is_linear,
-        frame.lease.abandonment_guard.is_map(),
+        lease.token.is_ref() && modifier_is_linear,
+        lease.abandonment_guard.is_map(),
+    ))
+}
+
+#[rustler::nif]
+fn inspect_binary_frame(frame: Frame<'_>) -> Result<BinaryFrameSummary, String> {
+    let storage = match &frame.storage {
+        Storage::Binary(storage) => storage,
+        _ => return Err("unsupported storage".to_string()),
+    };
+    let descriptor = video_interop::FrameDescriptor {
+        coded_width: frame.coded_width,
+        coded_height: frame.coded_height,
+        visible_rect: frame.visible_rect.clone(),
+        storage: frame.storage.clone(),
+        acquire_sync: frame.acquire_sync.clone(),
+    };
+    descriptor.validate().map_err(|error| error.to_string())?;
+    let plane = storage
+        .planes
+        .first()
+        .ok_or_else(|| "validated binary storage has no plane".to_string())?;
+
+    Ok((
+        frame.coded_width,
+        frame.coded_height,
+        storage.data.len(),
+        plane.offset,
+        plane.stride,
+        matches!(frame.acquire_sync, AcquireSync::Implicit),
+        frame.lease.is_none(),
     ))
 }
 
@@ -279,7 +315,9 @@ fn retire_frame(
         .prepare_cloexec(&dispatcher)
         .map_err(|error| error.to_string())?;
     let (owned_frame, lease) = prepared.claim().into_parts();
-    lease.retire();
+    lease
+        .ok_or_else(|| "claimed borrowed frame has no lease".to_string())?
+        .retire();
     drop(owned_frame);
     Ok(true)
 }
@@ -294,7 +332,9 @@ fn retire_claim(claim: ResourceArc<NativeClaim>) -> Result<bool, String> {
 
     if let Some(claimed) = claimed {
         let (owned_frame, lease) = claimed.into_parts();
-        lease.retire();
+        lease
+            .ok_or_else(|| "claimed borrowed frame has no lease".to_string())?
+            .retire();
         drop(owned_frame);
     }
 

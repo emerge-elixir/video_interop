@@ -6,12 +6,15 @@ First public release.
 
 ### Frame contract
 
-- Add Elixir and Rust types for Linux DMA-BUF frames, layers, planes, modifiers,
-  visible geometry, color information, and sync-file acquire fences.
-- Validate descriptor bounds, object references, plane layout, stream format,
-  and DMA-BUF allocation sizes.
-- Duplicate retained file descriptors with `FD_CLOEXEC` and close owned copies
-  when their Rust values are dropped.
+- Add Elixir and Rust types for owned binary and borrowed Linux DMA-BUF frames,
+  including binary strides, packed grayscale interpretation, DMA-BUF layers,
+  planes, modifiers, visible geometry, color information, and sync-file fences.
+- Validate binary dimensions and byte bounds, descriptor bounds, object
+  references, plane layout, stream format, storage ownership, and DMA-BUF
+  allocation sizes.
+- Prepare owned binary frames for native queues without lease clients, and
+  require exact leases while duplicating borrowed descriptors with `FD_CLOEXEC`.
+- Close owned file-descriptor copies when their Rust values are dropped.
 - Keep timestamps in the transport rather than the frame descriptor.
 
 ### Leases and consumers

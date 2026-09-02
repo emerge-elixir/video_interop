@@ -66,7 +66,10 @@ fn dispatcher_health(probe: ResourceArc<TestDispatcherProbe>) -> &'static str {
 
 #[rustler::nif]
 fn guard_is_opaque_resource(frame: Frame<'_>) -> bool {
-    frame.lease.abandonment_guard.is_map()
+    frame
+        .lease
+        .as_ref()
+        .is_some_and(|lease| lease.abandonment_guard.is_map())
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
@@ -107,7 +110,9 @@ fn retire_frame(
         .prepare_cloexec(&dispatcher)
         .map_err(|error| error.to_string())?;
     let (owned_frame, lease) = prepared.claim().into_parts();
-    lease.retire();
+    lease
+        .ok_or_else(|| "claimed borrowed frame has no lease".to_string())?
+        .retire();
     drop(owned_frame);
     Ok(true)
 }
@@ -122,7 +127,9 @@ fn retire_claim(claim: ResourceArc<NativeClaim>) -> Result<bool, String> {
 
     if let Some(claimed) = claimed {
         let (owned_frame, lease) = claimed.into_parts();
-        lease.retire();
+        lease
+            .ok_or_else(|| "claimed borrowed frame has no lease".to_string())?
+            .retire();
         drop(owned_frame);
     }
 

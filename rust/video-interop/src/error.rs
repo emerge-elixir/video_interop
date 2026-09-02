@@ -54,6 +54,18 @@ pub enum ValidationError {
     NegativeFd { index: usize, fd: i32 },
     #[error("acquire fence has negative fd {0}")]
     NegativeAcquireFence(i32),
+    #[error("binary storage has no planes")]
+    EmptyBinaryPlanes,
+    #[error("binary storage has {0} planes; only one plane is supported")]
+    UnsupportedBinaryPlaneCount(usize),
+    #[error("binary storage plane has zero stride")]
+    ZeroBinaryStride,
+    #[error("binary storage plane offset {offset} is outside {data_size} bytes")]
+    BinaryOffsetOutOfBounds { offset: u64, data_size: u64 },
+    #[error("binary storage last row starts at {offset}, outside {data_size} bytes")]
+    BinaryLastRowOutOfBounds { offset: u64, data_size: u64 },
+    #[error("binary storage requires implicit synchronization")]
+    BinaryStorageRequiresImplicitSync,
     #[error("object {index} is not referenced by any descriptor plane")]
     UnreferencedObject { index: usize },
     #[error("object {index} has zero size")]
@@ -130,6 +142,10 @@ pub type ReleaseWorkerError = DispatcherError;
 #[cfg(feature = "rustler")]
 #[derive(Debug, Error)]
 pub enum PrepareError {
+    #[error("borrowed video frame storage requires a lease")]
+    MissingLease,
+    #[error("owned binary video frame storage must not carry a lease")]
+    UnexpectedLease,
     #[error(transparent)]
     Duplicate(#[from] DuplicateError),
     #[error(transparent)]

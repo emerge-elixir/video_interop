@@ -1,7 +1,8 @@
 defmodule VideoInterop.Validator do
   @moduledoc "Structural validation and producer-authority verification for borrowed frames."
 
-  alias VideoInterop.{AbandonmentGuard, Colorimetry, Frame, Lease, Rect, SyncFile}
+  alias VideoInterop.{AbandonmentGuard, Binary, Colorimetry, Frame, Lease, Rect, SyncFile}
+  alias VideoInterop.Binary.Plane, as: BinaryPlane
 
   alias VideoInterop.DMABuf.{
     Descriptor,
@@ -48,9 +49,10 @@ defmodule VideoInterop.Validator do
     with :ok <- positive_bounded(frame.coded_width, @max_u32, [:frame, :coded_width]),
          :ok <- positive_bounded(frame.coded_height, @max_u32, [:frame, :coded_height]),
          :ok <- validate_rect(frame.visible_rect, frame.coded_width, frame.coded_height),
-         :ok <- validate_storage(frame.storage),
+         :ok <- validate_storage(frame.storage, frame),
          :ok <- validate_acquire_sync(frame.acquire_sync),
-         :ok <- validate_lease(frame.lease) do
+         :ok <- validate_frame_format(frame),
+         :ok <- validate_storage_ownership(frame) do
       :ok
     end
   end
@@ -64,10 +66,12 @@ defmodule VideoInterop.Validator do
          :ok <- optional_rational(format.framerate, [:format, :framerate]),
          :ok <- validate_storage_format(format.storage),
          :ok <- stream_acquire_sync(format.acquire_sync),
+         :ok <- storage_acquire_sync(format.storage, format.acquire_sync),
          :ok <- colorimetry(format.colorimetry),
          :ok <- rational(format.pixel_aspect_ratio, [:format, :pixel_aspect_ratio]),
          :ok <- interlace_mode(format.interlace_mode),
-         :ok <- alpha_mode(format.alpha_mode) do
+         :ok <- alpha_mode(format.alpha_mode),
+         :ok <- storage_alpha_mode(format.storage, format.alpha_mode) do
       :ok
     end
   end
@@ -88,14 +92,31 @@ defmodule VideoInterop.Validator do
   def validate_frame_against_format(frame, format),
     do: {:error, {:invalid_frame_format_pair, frame, format}}
 
-  defp validate_storage(%Descriptor{} = descriptor), do: validate_descriptor(descriptor)
-  defp validate_storage(value), do: {:error, {:invalid_storage, value}}
+  defp validate_frame_against_format_without_frame_validation(frame, format) do
+    with :ok <- validate_format(format),
+         :ok <- matching_dimensions(frame, format),
+         :ok <- matching_storage(frame, format),
+         :ok <- matching_acquire_sync(frame.acquire_sync, format.acquire_sync) do
+      :ok
+    end
+  end
+
+  defp validate_storage(%Descriptor{} = descriptor, _frame), do: validate_descriptor(descriptor)
+
+  defp validate_storage(%Binary{} = storage, frame),
+    do: validate_binary_storage(storage, frame)
+
+  defp validate_storage(value, _frame), do: {:error, {:invalid_storage, value}}
 
   defp validate_storage_format(%DMABufFormat{} = format) do
     with :ok <- positive_bounded(format.fourcc, @max_u32, [:format, :storage, :fourcc]),
          :ok <- stream_modifier(format.modifier) do
       :ok
     end
+  end
+
+  defp validate_storage_format(%Binary.Format{} = format) do
+    binary_format(format)
   end
 
   defp validate_storage_format(value), do: {:error, {:invalid_storage_format, value}}
@@ -222,6 +243,21 @@ defmodule VideoInterop.Validator do
   defp stream_acquire_sync(policy),
     do: {:error, {:invalid_field, [:format, :acquire_sync], policy}}
 
+  defp storage_acquire_sync(%Binary.Format{}, :implicit), do: :ok
+
+  defp storage_acquire_sync(%Binary.Format{}, policy),
+    do: {:error, {:binary_format_requires_implicit_sync, policy}}
+
+  defp storage_acquire_sync(%DMABufFormat{}, _policy), do: :ok
+
+  defp storage_alpha_mode(%Binary.Format{pixel_format: :rgba8888}, _alpha_mode), do: :ok
+  defp storage_alpha_mode(%Binary.Format{}, :opaque), do: :ok
+
+  defp storage_alpha_mode(%Binary.Format{}, alpha_mode),
+    do: {:error, {:binary_format_requires_opaque_alpha, alpha_mode}}
+
+  defp storage_alpha_mode(%DMABufFormat{}, _alpha_mode), do: :ok
+
   defp matching_acquire_sync(_actual, :per_frame), do: :ok
   defp matching_acquire_sync(:implicit, :implicit), do: :ok
   defp matching_acquire_sync(%SyncFile{}, :sync_file), do: :ok
@@ -244,6 +280,30 @@ defmodule VideoInterop.Validator do
 
   defp validate_lease(value), do: {:error, {:invalid_lease, value}}
 
+  defp validate_storage_ownership(%Frame{
+         storage: %Binary{},
+         lease: nil,
+         acquire_sync: :implicit
+       }),
+       do: :ok
+
+  defp validate_storage_ownership(%Frame{storage: %Binary{}, lease: lease})
+       when not is_nil(lease),
+       do: {:error, {:binary_storage_must_not_have_lease, lease}}
+
+  defp validate_storage_ownership(%Frame{storage: %Binary{}, acquire_sync: sync}),
+    do: {:error, {:binary_storage_requires_implicit_sync, sync}}
+
+  defp validate_storage_ownership(%Frame{storage: %Descriptor{}, lease: lease}),
+    do: validate_lease(lease)
+
+  defp validate_frame_format(%Frame{format: nil, storage: %Descriptor{}}), do: :ok
+
+  defp validate_frame_format(%Frame{format: %VideoFormat{} = format} = frame),
+    do: validate_frame_against_format_without_frame_validation(frame, format)
+
+  defp validate_frame_format(%Frame{format: value}), do: {:error, {:invalid_frame_format, value}}
+
   defp matching_dimensions(frame, format) do
     if frame.coded_width == format.width and frame.coded_height == format.height do
       :ok
@@ -264,6 +324,21 @@ defmodule VideoInterop.Validator do
     end
   end
 
+  defp matching_storage(
+         %Frame{
+           storage: %Binary{},
+           format: %VideoFormat{storage: %Binary.Format{} = actual}
+         },
+         %VideoFormat{storage: %Binary.Format{} = expected}
+       ) do
+    if actual == expected,
+      do: :ok,
+      else: {:error, {:binary_format_mismatch, actual, expected}}
+  end
+
+  defp matching_storage(frame, format),
+    do: {:error, {:storage_format_mismatch, frame.storage, format.storage}}
+
   defp matching_fourcc(fourcc, fourcc), do: :ok
   defp matching_fourcc(actual, expected), do: {:error, {:fourcc_mismatch, actual, expected}}
 
@@ -274,6 +349,60 @@ defmodule VideoInterop.Validator do
       nil -> :ok
       object -> {:error, {:modifier_mismatch, object.modifier, modifier}}
     end
+  end
+
+  defp validate_binary_storage(
+         %Binary{data: data, planes: [%BinaryPlane{offset: offset, stride: stride}]},
+         %Frame{coded_width: width, coded_height: height, format: %VideoFormat{storage: format}}
+       )
+       when is_binary(data) do
+    with :ok <- binary_format(format),
+         :ok <- unsigned_bounded(offset, @max_u64, [:frame, :storage, :planes, 0, :offset]),
+         :ok <- positive_bounded(stride, @max_u32, [:frame, :storage, :planes, 0, :stride]),
+         {:ok, minimum_stride} <- binary_minimum_stride(width, format.pixel_format),
+         true <- stride >= minimum_stride,
+         {:ok, required_bytes} <-
+           binary_required_bytes(offset, stride, height, minimum_stride),
+         true <- byte_size(data) >= required_bytes do
+      :ok
+    else
+      false -> {:error, {:binary_storage_too_small, byte_size(data), width, height, stride}}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp validate_binary_storage(%Binary{planes: planes}, _frame),
+    do: {:error, {:unsupported_binary_planes, planes}}
+
+  defp binary_format(%Binary.Format{pixel_format: pixel_format, bw1_polarity: polarity})
+       when pixel_format in [:rgba8888, :rgb888, :gray8, :gray2] and is_nil(polarity),
+       do: :ok
+
+  defp binary_format(%Binary.Format{pixel_format: :bw1, bw1_polarity: polarity})
+       when polarity in [:one_is_black, :one_is_white],
+       do: :ok
+
+  defp binary_format(format), do: {:error, {:invalid_binary_format, format}}
+
+  defp binary_minimum_stride(width, :rgba8888), do: checked_stride(width, 4)
+  defp binary_minimum_stride(width, :rgb888), do: checked_stride(width, 3)
+  defp binary_minimum_stride(width, :gray8), do: checked_stride(width, 1)
+  defp binary_minimum_stride(width, :gray2), do: {:ok, div(width + 3, 4)}
+  defp binary_minimum_stride(width, :bw1), do: {:ok, div(width + 7, 8)}
+
+  defp checked_stride(width, bytes_per_pixel) do
+    case width * bytes_per_pixel do
+      stride when stride <= @max_u32 -> {:ok, stride}
+      _stride -> {:error, {:binary_stride_overflow, width, bytes_per_pixel}}
+    end
+  end
+
+  defp binary_required_bytes(offset, stride, height, row_bytes) do
+    required = offset + stride * (height - 1) + row_bytes
+
+    if required <= @max_u64,
+      do: {:ok, required},
+      else: {:error, {:binary_size_overflow, offset, stride, height}}
   end
 
   defp descriptor_version(1), do: :ok

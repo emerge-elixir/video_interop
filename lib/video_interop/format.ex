@@ -8,7 +8,7 @@ defmodule VideoInterop.Format do
   use implicit synchronization, sync files, or a compatibility per-frame mix.
   """
 
-  alias VideoInterop.Colorimetry
+  alias VideoInterop.{Binary, Colorimetry}
   alias VideoInterop.DMABuf
 
   @enforce_keys [:width, :height, :framerate, :storage]
@@ -30,7 +30,7 @@ defmodule VideoInterop.Format do
           width: pos_integer(),
           height: pos_integer(),
           framerate: {pos_integer(), pos_integer()} | nil,
-          storage: DMABuf.Format.t(),
+          storage: Binary.Format.t() | DMABuf.Format.t(),
           acquire_sync: acquire_sync(),
           colorimetry: Colorimetry.t(),
           pixel_aspect_ratio: {pos_integer(), pos_integer()},

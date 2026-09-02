@@ -1,7 +1,7 @@
 defmodule VideoInterop.FormatSchemaTest do
   use ExUnit.Case, async: true
 
-  alias VideoInterop.{Colorimetry, Format, SchemaNative}
+  alias VideoInterop.{Binary, Colorimetry, Format, SchemaNative}
   alias VideoInterop.DMABuf
   alias VideoInterop.DMABuf.FourCC
 
@@ -31,6 +31,20 @@ defmodule VideoInterop.FormatSchemaTest do
     }
 
     assert SchemaNative.round_trip_format(format) == {:ok, format}
+  end
+
+  test "round-trips binary storage formats" do
+    for storage <- [
+          %Binary.Format{pixel_format: :rgba8888},
+          %Binary.Format{pixel_format: :rgb888},
+          %Binary.Format{pixel_format: :gray8},
+          %Binary.Format{pixel_format: :gray2},
+          %Binary.Format{pixel_format: :bw1, bw1_polarity: :one_is_black},
+          %Binary.Format{pixel_format: :bw1, bw1_polarity: :one_is_white}
+        ] do
+      candidate = %{format() | storage: storage, acquire_sync: :implicit}
+      assert SchemaNative.round_trip_format(candidate) == {:ok, candidate}
+    end
   end
 
   test "round-trips every acquire and modifier policy without collapsing values" do

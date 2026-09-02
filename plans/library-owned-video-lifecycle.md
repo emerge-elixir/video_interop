@@ -1,10 +1,13 @@
 # Library-Owned Video Lifecycle and Emerge Integration
 
-Status: Phase 1 generic ownership/consumer foundation implemented; independent
-review and downstream phases remain.
+Status: Superseded for Emerge integration. The generic ownership foundation
+remains, but renderer-owned targets, Emerge consumer sessions, and direct
+connection APIs were replaced by atom targets, `Emerge.submit_video_frame/3`,
+and `membrane_video_interop` transport. The remainder is retained as historical
+design context.
 
-This plan supersedes the application-owned `PrimeBridge` and `PrimeRenderer`
-approach in `/workspace/emerge_demo`. It refines Phase 2 and the consumer side of
+This plan originally superseded the application-owned `PrimeBridge` and
+`PrimeRenderer` approach in `/workspace/emerge_demo` and refined Phase 2 of
 `membrane-video-interop-migration.md`.
 
 ## Goal
