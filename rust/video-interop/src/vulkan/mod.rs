@@ -1,9 +1,8 @@
-//! Experimental Vulkan DMA-BUF import adapter.
+//! Vulkan DMA-BUF import adapter.
 //!
-//! The API may change while pinned V3DV hardware testing continues. The module provides DMA-BUF
-//! validation, external-memory import, device capability queries, and acquire/release
-//! synchronization. A renderer supplies an already selected Vulkan device and may wrap
-//! [`ImportedDmaBufImage::image`] in its own rendering API.
+//! The module provides DMA-BUF validation, external-memory import, device capability queries, and
+//! acquire/release synchronization. A renderer supplies an already selected Vulkan device and may
+//! wrap [`ImportedDmaBufImage::image`] in its own rendering API.
 
 mod capability;
 mod error;

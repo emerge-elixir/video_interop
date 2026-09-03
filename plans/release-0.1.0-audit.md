@@ -1,179 +1,111 @@
 # VideoInterop 0.1.0 Release Audit
 
-Status: release preparation passes locally; publication is still blocked by repository and release
-operations.
+Status: **no-go from the current checkout; implementation and package checks pass, but release-state
+and credential blockers remain**
 
-Audit date: 2026-09-01
+Audit date: 2026-09-03
 
-Candidate implementation: `2d82d1958c6cd2693982901794dc9af22e87d7d7`
+Candidate state: clean release-documentation commit on local `main`. The final dated release commit
+does not exist yet.
 
-This candidate includes `09a14a3` and the local compiler, CI, package, and documentation fixes.
+## Decision
 
-## Scope
+No source-code, ownership, synchronization, package-closure, or documentation defect found by this
+audit blocks 0.1.0. Vulkan is part of the supported 0.1 contract. Remaining V3DV qualification is
+platform follow-up and does not change the API status.
 
-This audit covers the first public release of:
+Publication cannot start from this checkout yet. The source must first be pushed, made public,
+dated, tagged, and validated by exact-tag CI. Registry credentials are also unavailable in the
+current environment.
 
-- Hex package `video_interop` 0.1.0;
-- crates.io crate `video-interop` 0.1.0.
+## Release blockers
 
-It checks compiler warnings, supported toolchains, tests, documentation, package contents, source
-parity, CI, repository access, hardware claims, and downstream release order.
+### 1. Final candidate is not pushed
 
-## Summary
+Local `main` is eight commits ahead of `origin/main`. The working tree is clean and includes the
+Vulkan support wording corrections in public docs, release docs, Rust module documentation, and
+this refreshed audit.
 
-The source and both package formats now pass the local release checks. The Elixir compiler warnings
-were removed, Elixir 1.17/OTP 27 was tested, Rust 1.91 and latest stable passed the complete build,
-test, Clippy, and Rustdoc matrix, and the unpacked Hex package compiles without sibling files.
-Generated Hex and Cargo packages contain the same production Rust source.
+Before release:
 
-The public docs now introduce the library through short examples and describe Vulkan as
-experimental. This allows the core, Rustler, lease, consumer, and EGL contracts to ship without
-claiming that the remaining V3DV hardware work is complete.
+1. push the local commits;
+2. verify `git diff --check` and `git status --short` is empty;
+3. run the complete release matrix from that exact commit.
 
-Do not publish yet. The GitHub repository still returns 404 to anonymous users, local `main` is
-ahead of `origin/main`, and no release tag exists. Registry credentials and exact-tag CI also remain
-external release steps.
+Both published artifacts must be generated from this one clean commit.
 
-## Findings
+### 2. The source repository is not publicly reachable
 
-### 1. Elixir warnings-as-errors failure — resolved locally
+Anonymous access to <https://github.com/emerge-elixir/video_interop> currently returns HTTP 404.
+The package metadata, README badges, source links, docs.rs metadata, HexDocs source links, and crate
+README all point there.
 
-Elixir 1.20 previously reported four type warnings around direct `Consumer.impl_for/1` and
-`ConsumerSession.impl_for/1` calls. Protocol lookup now goes through a dynamic helper, preserving
-support for implementations compiled by downstream applications.
+Before tagging:
 
-These commands now pass for the source and unpacked Hex package:
-
-```sh
-mix compile --force --warnings-as-errors
-mix test
-```
-
-CI now runs warnings-as-errors compilation before tests.
-
-### 2. Source repository and release commit are not public — open
-
-Package metadata points to:
-
-```text
-https://github.com/emerge-elixir/video_interop
-```
-
-Anonymous GitHub requests return 404. The recorded branch state is:
-
-```text
-2d82d19 local main
-194b34b origin/main
-```
-
-Before publishing:
-
-1. push all commits, including `09a14a3`;
+1. push all local commits to `origin/main`;
 2. make the repository public;
-3. check anonymous clone and every package/documentation link;
-4. tag only the public commit used to build both packages.
+3. verify anonymous clone, README badges, license, source links, and the Actions workflow;
+4. confirm branch protection and tag workflow permissions.
 
-### 3. Vulkan release policy — resolved for 0.1
+### 3. Final date, tag, and public CI run do not exist
 
-The root README, crate README, changelog, Rust Vulkan module, and Emerge integration guide now call
-Vulkan experimental. Pinned-RPi5 pixel, validation/MMU, synchronization-fault, restart, and soak
-testing remains required before changing that label.
+`CHANGELOG.md` still says `0.1.0 - Unreleased`, and there is no `v0.1.0` tag. This is correct until
+the final release commit is ready.
 
-### 4. Toolchain floors — resolved locally and in CI
+Immediately before tagging:
 
-The package still declares Elixir `~> 1.17`. The complete 104-test suite passes on:
+1. replace `Unreleased` with the actual release date;
+2. commit that release metadata;
+3. create and push annotated tag `v0.1.0` on the same commit;
+4. wait for every tag CI dependency and the `release-tag` job to pass.
 
-- Elixir 1.17.3 / OTP 27;
-- Elixir 1.20.2 / OTP 29.
+The tag gate already verifies the tag name, Cargo version, Mix version, and dated changelog heading.
 
-The crate declares Rust 1.91. The debug build, release build, test matrix, Clippy matrix, and Rustdoc
-pass on:
+### 4. Registry and GitHub credentials are unavailable
 
-- Rust 1.91.0;
-- latest stable used by this audit, Rust 1.98.0.
+The current environment has no `HEX_API_KEY`, Cargo registry token, GitHub token, Cargo credentials
+file, or authenticated Hex configuration. `mix hex.publish --dry-run` reaches authentication and
+then fails because no Hex user is configured.
 
-CI now contains both Elixir combinations and both Rust toolchains.
+Authenticate outside the repository before the release session. Do not put tokens in files tracked
+by Git or in command arguments retained by shell history.
 
-### 5. Publication is manual and exact-tag verification is pending — open
+## Registry state
 
-`RELEASING.md` now records the validation, tag, publication, registry verification, downstream,
-yank, and failure steps. Publication remains manual and requires successful CI on `v0.1.0`. A
-tag-only CI job checks that the tag, both package versions, and dated changelog heading agree.
+Checked on 2026-09-03:
 
-The current environment has no authenticated Hex user. A prior crates.io dry run passed. Recheck
-both registry names immediately before tagging; availability is not a reservation.
+- crates.io reports that `video-interop` does not exist;
+- Hex reports that `video_interop` does not exist.
 
-### 6. CI release gates — resolved locally
+The names are currently available but are not reserved. Recheck immediately before publishing.
+Publish `video-interop` first, then `video_interop`.
 
-`.github/workflows/ci.yml` now requires:
+## Validation performed
 
-- Elixir formatting, warnings-as-errors compilation, and tests on minimum and current versions;
-- ExDoc with warnings denied;
-- unpacked Hex compilation;
-- core and all-feature builds/tests for the Rust source embedded in Hex;
-- debug and release Rust workspace builds with every target and feature;
-- workspace, core-only, EGL-only, Vulkan-only, and all-feature tests;
-- workspace/all-feature and per-feature Clippy with `-D warnings`;
-- Rustdoc with `-D warnings`;
-- a clean `cargo package` and tests from the generated crate;
-- Rust 1.91 and latest stable;
-- reproducible and validated SPIR-V;
-- tag, package-version, and changelog-date agreement before a tag run can pass.
+### Elixir and OTP
 
-The new package parity script rejects dirty production-source differences and compiled files in the
-Hex archive. The workflow itself still needs a public GitHub run before tagging.
+Passed on both supported combinations:
 
-### 7. Public documentation — resolved for the initial release
+- Elixir 1.17.3 / OTP 27.3.4.3;
+- Elixir 1.20.2 / OTP 29.0.5.
 
-The READMEs now follow the direct, example-led style used by Solve. Installation and a small frame
-example come before implementation details. Dense implementation history was removed from the
-changelog.
-
-The docs now cover:
-
-- process-local fd limits;
-- caller and consumer ownership after transfer;
-- lease fan-out and draining;
-- native prepare/claim behavior;
-- dispatcher shutdown;
-- EGL display, context, function, and thread responsibility;
-- Vulkan experimental status and caller responsibility;
-- supported Elixir and Rust versions.
-
-ExDoc now has a public source URL and version-tag source ref. Rustdoc passes with warnings denied on
-Rust 1.91 and latest stable. More item-level Vulkan documentation can be added as that experimental
-API settles; it is not a 0.1 publication blocker.
-
-### 8. Cross-package source parity — resolved locally
-
-`scripts/check-release-artifact-parity.sh` builds and unpacks both package formats. It compares:
-
-- Elixir source, root manifests, README, changelog, and license in the Hex package;
-- crate manifest, source, GLSL, SPIR-V, README, and license in Hex;
-- the same Rust production files and `Cargo.toml.orig` in the Cargo archive.
-
-It also rejects `_build`, `deps`, `target`, `priv/native`, NIF libraries, and BEAM files in Hex.
-The check passes from a clean temporary Git repository without `--allow-dirty`.
-
-## Validation results
-
-### Elixir
-
-Passed:
+Checks:
 
 ```sh
+mix deps.get
 mix format --check-formatted
 mix compile --force --warnings-as-errors
 mix test
 mix docs --warnings-as-errors
+mix hex.audit
 ```
 
-Result: 104 tests on both supported Elixir/OTP combinations. The lifecycle test intentionally logs
-one supervised process crash while verifying an invalid issue reservation.
+Result: 113 ExUnit tests pass. The invalid-reservation lifecycle test intentionally logs one
+supervised `LeaseOwner` termination while asserting the failure boundary.
 
 ### Rust
 
-Passed on Rust 1.91 and Rust 1.98:
+Passed on Rust 1.91.0 and current stable 1.98.0:
 
 ```sh
 cargo fmt --all -- --check
@@ -191,46 +123,83 @@ cargo clippy -p video-interop --no-default-features --features vulkan --all-targ
 RUSTDOCFLAGS="-D warnings" cargo doc -p video-interop --all-features --no-deps
 ```
 
-All-feature result: 42 crate unit tests, 8 descriptor tests, 2 fd tests, schema fixture builds, and
-doctests.
+The all-feature crate run passes 47 unit tests, 8 descriptor integration tests, 2 FD ownership
+tests, schema fixture builds, and doctests.
 
-A descriptor cleanup test was made independent of fd-number reuse after the expanded feature matrix
-exposed its race.
+### Shaders
 
-### Packages and shaders
+The pinned glslang 16.4.0 check passes for all three compute shaders. Regenerated SPIR-V is
+byte-identical to the committed artifacts and passes `spirv-val` for Vulkan 1.1.
 
-Passed:
+### Hex package
 
-- unpacked Hex production compilation with warnings denied;
-- embedded crate core and all-feature tests;
-- clean Cargo package verification;
-- generated crate core and Vulkan tests;
-- Hex/Cargo production-source parity;
-- reproducible shader byte comparison and `spirv-val` validation.
+`mix hex.build --unpack` produces 54 files containing only the intended Elixir source, package
+documentation, license, and canonical embedded Rust crate source. It contains no `_build`, `deps`,
+workspace `target`, native library, BEAM file, or sibling path dependency.
 
-Current Cargo archive: 31 files, about 390.5 KiB unpacked and 75.2 KiB compressed.
+The unpacked package passes warnings-as-errors production compilation. Its embedded crate passes
+core-only and all-feature tests using registry dependencies.
 
-### Downstream
+The provisional archive built from the current working tree is 112,640 bytes. Its checksum is not
+a release checksum because the changelog date and final commit still need to change.
 
-The reconciled Emerge 0.4 integration tree previously passed `./ci-tests.sh all` against this local
-source: 462 Elixir tests, 1,005 Rust tests, Clippy, Credo, and Dialyzer.
+### Cargo package
 
-Registry-only downstream validation cannot run until both packages are published.
+`cargo publish -p video-interop --dry-run --allow-dirty` passes packaging, registry dependency
+resolution, and crate verification. The package contains 31 files, including the canonical source,
+integration tests, GLSL, and SPIR-V artifacts. It has no sibling path dependency.
 
-## Remaining release steps
+The `video-interop` and `video_interop` package production sources match. The parity check passes
+both in the current working tree with the explicit audit override and in a clean temporary Git
+snapshot without an override.
 
-1. Push `main`, make the repository public, and verify anonymous access.
-2. Add the release date to `CHANGELOG.md`.
-3. Run the release checks from a clean public clone.
-4. Create and push `v0.1.0`; wait for every tag CI job.
-5. Recheck package-name availability and publish `video-interop` first.
-6. Fetch and test all crate features from crates.io.
-7. Publish `video_interop`, then compile a clean project from Hex.
-8. Remove Emerge's normal path patches, regenerate both lock files, and run registry-only Emerge
-    CI and package compilation.
+### Metadata and dependencies
+
+- Mix and Cargo versions both equal `0.1.0`.
+- The crate declares Rust 1.91 and edition 2024.
+- The Hex package declares Elixir `~> 1.17`.
+- The Hex package has no production dependency.
+- The published crate uses registry dependencies only.
+- Root and crate Apache-2.0 license files are byte-identical.
+- `mix hex.audit` reports no retired or vulnerable Hex dependencies.
+- ExDoc 0.40.4 is available while the development lock uses 0.40.3; this is optional and not a
+  release blocker.
+
+### Downstream source integration
+
+The current local VideoInterop source passes with:
+
+- Emerge: 1,007 Rust tests and 435 Elixir tests;
+- `membrane_video_interop`: 12 tests;
+- `membrane_video_transcode`: 10 tests;
+- `emerge_demo`: 58 tests.
+
+Registry-only downstream validation remains necessarily blocked until both packages are published.
+
+## Non-blocking follow-up
+
+- Continue pinned-RPi5/V3DV pixel, validation, fault-injection, restart, and soak qualification.
+- Continue behavior-neutral Vulkan module decomposition if desired; do not delay 0.1.0 solely for
+  that refactor.
+- Add automated dependency advisory tooling later if desired; current CI already validates package
+  closure, minimum toolchains, features, shaders, and source parity.
+
+## Exact remaining sequence
+
+1. Push `main`, make the GitHub repository public, and verify anonymous access.
+2. Run `RELEASING.md` from a clean public clone.
+3. Set the final changelog date and commit it.
+4. Recheck both registry names.
+5. Create and push annotated `v0.1.0`; wait for all tag CI jobs.
+6. Authenticate and run `cargo publish -p video-interop` from the tagged checkout.
+7. Fetch `video-interop = "=0.1.0"` from crates.io and test core, default, EGL, and Vulkan features.
+8. Run `mix hex.publish` from the same tagged checkout.
+9. Fetch `{:video_interop, "== 0.1.0"}` in a clean Mix project and verify compilation and HexDocs.
+10. Create the GitHub release.
+11. Remove downstream path overrides, regenerate locks, and run registry-only Emerge and adapter CI.
 
 ## Release decision
 
-**No-go for publication from the current local branch.** Local source, documentation, CI, and
-package blockers are resolved. Public repository access, exact-tag CI, credentials, registry
-publication, and downstream registry-only validation still require maintainer action.
+**No-go from the current checkout.** The implementation and package artifacts are release-ready.
+The remaining blockers are final source control state, public repository access, exact-tag CI, and
+registry authentication/publication.

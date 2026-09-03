@@ -113,8 +113,8 @@ After Hex accepts it, create a temporary Mix project with:
 Fetch it from Hex, compile with warnings denied, and check the generated HexDocs
 source links.
 
-Create the GitHub release from `v0.1.0`. Mention that Vulkan support is
-experimental.
+Create the GitHub release from `v0.1.0`. Include the supported Vulkan scope and
+platform requirements.
 
 ## Update downstream projects
 

@@ -11,7 +11,7 @@ Completed locally:
 - Rust 1.91/latest debug, release, test, Clippy, Rustdoc, feature, and package checks;
 - unpacked Hex compilation and embedded-crate tests;
 - package source parity and shader checks;
-- public documentation rewrite and Vulkan experimental policy;
+- public documentation rewrite and Vulkan support policy;
 - maintainer release checklist.
 
 Waiting on maintainer or external state:
@@ -19,8 +19,12 @@ Waiting on maintainer or external state:
 - push the candidate;
 - make GitHub public and verify links;
 - run exact-tag CI and publish both packages;
-- migrate Emerge to registry-only dependencies;
-- complete V3DV hardware qualification before removing the experimental label.
+- migrate Emerge to registry-only dependencies.
+
+Non-blocking platform follow-up:
+
+- complete the remaining V3DV hardware qualification without changing Vulkan's supported API
+  status.
 
 ## Goal
 
@@ -37,13 +41,12 @@ artifacts.
 Recommended 0.1 scope:
 
 - accept the Elixir descriptor, validation, lease, consumer, and ownership contracts;
-- accept the Rust core, Rustler schema, fd ownership, and EGL adapter contracts;
-- publish the Vulkan adapter as **experimental** until the pinned-RPi5 qualification matrix is
-  complete;
+- accept the Rust core, Rustler schema, fd ownership, EGL adapter, and Vulkan adapter contracts;
+- publish the Vulkan adapter as supported while documenting its platform requirements;
 - retain SemVer 0.x freedom while documenting every ownership boundary as correctness-critical.
 
-If Vulkan is to be advertised as stable instead, stop before publication and complete the hardware
-qualification gate in Phase 6.
+Pinned-RPi5 qualification remains tracked in Phase 6 without changing Vulkan's supported API
+status.
 
 ## Release gates
 
@@ -235,7 +238,7 @@ Work:
    - lease and ownership behavior;
    - Rustler boundary support;
    - EGL support;
-   - Vulkan experimental status or completed qualification;
+   - Vulkan support and platform requirements;
    - Linux/process-local fd limitations;
    - Elixir/Rust minimum versions.
 2. Add the final release date only when tagging.
@@ -243,8 +246,7 @@ Work:
 4. Document raw EGL/Vulkan handle lifetime, queue authority, external synchronization, and
    destruction preconditions.
 5. Add item-level Rust documentation where ownership, raw handles, synchronization, or cleanup can
-   be misunderstood. Keep the remaining experimental Vulkan fields out of a crate-wide
-   missing-docs gate until that API settles after 0.1.
+   be misunderstood, including the supported Vulkan fields.
 6. Ensure ExDoc describes nonstandard `LeaseOwner.start_link/1` producer linking,
    `start_supervised/1`, reservation ownership boundaries, callback execution, retries, and drain.
 7. State that fd integers are local borrowed handles and are not serializable or Erlang-node-safe.
@@ -285,16 +287,10 @@ Work:
 Exit gate: anonymous users can inspect the exact candidate source and maintainers can authenticate
 to both registries without storing credentials in Git or shell history.
 
-## Phase 6 — Resolve Vulkan qualification policy
+## Phase 6 — Complete Vulkan platform qualification
 
-### Recommended fast release path
-
-Mark Vulkan experimental for 0.1.0 and preserve the existing host safety tests. Record that pinned
-hardware qualification remains required before declaring it stable.
-
-### Stable Vulkan alternative
-
-Complete the existing pinned-RPi5 matrix before continuing:
+Vulkan is part of the supported 0.1 contract. Preserve the existing host safety tests and continue
+the pinned-RPi5 matrix as non-blocking platform qualification without changing that API status:
 
 - exact-pixel NV12 and packed fixtures;
 - Vulkan validation and V3DV MMU/kernel logs;
@@ -304,8 +300,8 @@ Complete the existing pinned-RPi5 matrix before continuing:
 - confirmed `LinearBufferToOptimalYuvPlanes` production strategy;
 - throughput target with at least 30% GPU headroom.
 
-Exit gate: documentation accurately reflects the chosen policy and no unqualified stability claim
-remains.
+Exit gate: documentation accurately reflects the supported Vulkan scope and records remaining
+platform-specific qualification work.
 
 ## Phase 7 — Clean release-candidate validation
 
@@ -374,7 +370,8 @@ source commit in the release audit.
 
 9. In a clean temporary Mix project, fetch `{:video_interop, "== 0.1.0"}`, compile with warnings
    denied, and verify HexDocs.
-10. Create the GitHub release from the same tag with user-facing notes and experimental limitations.
+10. Create the GitHub release from the same tag with the supported Vulkan scope and platform
+    requirements.
 
 Stop if either artifact differs from the tagged source. Do not publish downstream packages against
 an unverified or yanked dependency.
@@ -421,7 +418,7 @@ VideoInterop 0.1.0 is ready only when:
 - minimum and current toolchains pass;
 - artifact parity and shader reproducibility pass;
 - GitHub is public and contains the exact candidate commit;
-- Vulkan is qualified or explicitly experimental;
+- Vulkan's supported contract and remaining platform qualification are documented;
 - exact-tag CI passes;
 - crates.io and Hex artifacts are independently fetched and verified;
 - Emerge passes registry-only full CI and package-source compilation;

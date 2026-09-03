@@ -34,9 +34,8 @@ First public release.
 
 - Add dynamically loaded EGL native-fence creation, import, duplication, waits,
   and polling without a link-time EGL or GL dependency.
-- Add an experimental Vulkan module for DMA-BUF capability checks, memory
-  import, sync-file waits, external queue ownership, release fences, and bounded
-  import caches.
+- Add a Vulkan module for DMA-BUF capability checks, memory import, sync-file
+  waits, external queue ownership, release fences, and bounded import caches.
 - Add renderer-owned staging for NV12 and packed RGBA/BGRA when producer
   allocations cannot be wrapped directly, including plane-for-plane copies from
   non-linear NV12 images into ordinary optimal Y and UV images.
@@ -56,6 +55,4 @@ First public release.
 
 - File descriptor integers are local to one OS process and cannot be sent to
   another Erlang node.
-- Vulkan support is experimental until the pinned-RPi5 hardware matrix is
-  complete.
 - Metal and Direct3D adapters are not included.

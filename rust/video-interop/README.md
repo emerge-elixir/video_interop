@@ -11,8 +11,7 @@ framework.
 
 ## Status
 
-The core, Rustler, and EGL APIs are part of the 0.1 release. The Vulkan module
-is experimental while V3DV hardware testing continues.
+The core, Rustler, EGL, and Vulkan APIs are part of the supported 0.1 contract.
 
 The crate supports Rust 1.91 and newer.
 
@@ -95,9 +94,9 @@ thread valid. The module has no link-time EGL or GL dependency.
 
 ## Vulkan
 
-The `vulkan` feature is experimental. It accepts a caller-owned `ash` device and
-provides DMA-BUF capability checks, memory import, sync-file waits, queue-family
-ownership transfer, and release-fence handling.
+The `vulkan` feature accepts a caller-owned `ash` device and provides DMA-BUF
+capability checks, memory import, sync-file waits, queue-family ownership
+transfer, and release-fence handling.
 
 Imported images stay in a bounded source cache. With planar preference,
 non-linear NV12 is imported as a transfer-source image and copied plane-for-plane
@@ -114,8 +113,8 @@ The caller remains responsible for:
 - renderer waits and release submission;
 - presentation and device-loss recovery.
 
-Do not treat the Vulkan API as stable until the pinned-RPi5 validation work is
-complete.
+Platform-specific qualification is tracked separately from the Vulkan API's
+supported status.
 
 ## Features
 
@@ -123,7 +122,7 @@ complete.
 | --- | --- | --- |
 | `rustler` | yes | Elixir schema codecs, prepared/claimed frames, release dispatcher |
 | `egl` | no | Dynamically loaded EGL native-fence helpers |
-| `vulkan` | no | Experimental DMA-BUF import and synchronization helpers |
+| `vulkan` | no | DMA-BUF import and synchronization helpers |
 | `test-support` | no | Rustler helpers used by schema tests |
 
 ## License

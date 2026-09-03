@@ -20,9 +20,8 @@ choose how frames travel through an application.
 Version 0.1 supports owned RGBA8888, RGB888, Gray8, Gray2, and BW1 binaries,
 plus Linux DMA-BUF frames and sync-file acquire fences.
 
-The frame, binary, DMA-BUF, validation, lease, Rustler, and EGL APIs are the
-supported 0.1 contract. The Vulkan module is experimental. Its API may change while hardware
-testing on V3DV continues.
+The frame, binary, DMA-BUF, validation, lease, Rustler, EGL, and Vulkan APIs are
+the supported 0.1 contract.
 
 File descriptor integers are only useful inside one operating-system process.
 They cannot be sent to another Erlang node. A process boundary requires an OS
@@ -238,7 +237,7 @@ The EGL module loads native-fence functions from the caller's EGL library. The
 caller still owns the display, context, thread rules, and function addresses.
 VideoInterop does not link EGL or GL.
 
-Enable the experimental Vulkan module with:
+Enable the Vulkan module with:
 
 ```toml
 video-interop = { version = "0.1", features = ["vulkan"] }
@@ -250,8 +249,8 @@ sync-file waits. It also contains bounded fallback paths for linear NV12 and
 packed images when a device cannot sample the producer image directly.
 
 The caller owns device selection, queue serialization, renderer integration,
-and final presentation. Vulkan support should not be treated as stable until
-the pinned-RPi5 qualification work is complete.
+and final presentation. Platform-specific qualification does not change the
+Vulkan module's supported API status.
 
 ## Development
 
