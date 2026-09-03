@@ -92,8 +92,8 @@ struct DispatcherState {
 ///
 /// The lifecycle owner must call [`ReleaseDispatcher::close_and_join`] from a
 /// dirty-I/O NIF after every holder and claim drains. Resource destructors never
-/// wait or join. Dropping the last reference before an explicit join is fatal,
-/// because otherwise a worker could execute unloaded NIF code.
+/// wait or join. Dropping the last reference before an explicit join is fatal
+/// to prevent a worker from executing unloaded NIF code.
 pub struct ReleaseDispatcher {
     sender: Sender<WorkerCommand>,
     state: Mutex<DispatcherState>,
@@ -170,7 +170,7 @@ impl ReleaseDispatcher {
     /// lifecycle-owned dirty-I/O NIF (or a native non-BEAM thread).
     ///
     /// A timeout leaves the dispatcher in `Stopping`; the owner resource and
-    /// worker remain live and a later call may retry the join.
+    /// worker remain live. A later call retries the join.
     pub fn close_and_join(&self, timeout: Duration) -> Result<(), DispatcherError> {
         let deadline = Instant::now()
             .checked_add(timeout)
@@ -259,7 +259,7 @@ impl ReleaseDispatcher {
                     fatal_dispatcher_corruption("dispatcher worker panicked during shutdown");
                 }
                 // Publish completion only after `join` collected the already-finished
-                // worker. Concurrent closers can now return without touching the
+                // worker. Concurrent closers now return without touching the
                 // lifecycle mutex, even if this caller is descheduled afterward.
                 self.health.store(STOPPED, Ordering::SeqCst);
                 return Ok(());
@@ -436,7 +436,7 @@ impl Drop for AbandonmentGuard {
 /// Once returned to BEAM, enqueue loss while accepting is fatal lifecycle
 /// corruption. After lifecycle close, a stale guard is inert.
 /// Returns whether a term is this producer NIF's registered guard resource.
-/// Producer authority callbacks should expose this constant-time check.
+/// Producer authority callbacks must expose this constant-time check.
 pub fn is_abandonment_guard_resource(term: Term<'_>) -> bool {
     term.decode::<ResourceArc<AbandonmentGuard>>().is_ok()
 }

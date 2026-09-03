@@ -5,15 +5,40 @@
 [![crates.io](https://img.shields.io/crates/v/video-interop.svg)](https://crates.io/crates/video-interop)
 [![CI](https://github.com/emerge-elixir/video_interop/actions/workflows/ci.yml/badge.svg)](https://github.com/emerge-elixir/video_interop/actions/workflows/ci.yml)
 
-VideoInterop describes owned and borrowed video frames as plain Elixir and Rust data.
+## The problem
 
-A producer can hand an immutable BEAM binary or a Linux DMA-BUF to a renderer or
-another native consumer without tying either side to a streaming framework.
-Owned binaries need no lease. Borrowed storage carries synchronization metadata
-and a lease that tells the producer when the consumer is finished.
+A zero-copy Linux GPU pipeline keeps video data in DMA-BUF allocations and
+passes file descriptors between native producers and consumers. A file
+descriptor alone does not define the image. Every frame also requires plane
+layout, pixel format, modifier, geometry, colorimetry, synchronization, and a
+lifetime contract.
+
+Rust elements produce and consume the GPU frames while Elixir coordinates the
+pipeline. Copying a frame into a BEAM binary transfers the pixels into CPU-owned
+memory and breaks zero-copy operation. Passing a borrowed file descriptor
+without ownership tracking either releases the producer buffer while a consumer
+uses it or prevents the producer from reclaiming it.
+
+## The solution
+
+VideoInterop defines matching Elixir and Rust representations for complete video
+frames. It provides:
+
+- owned binary frames for CPU data;
+- borrowed Linux DMA-BUF frames for zero-copy GPU data;
+- explicit image layout, colorimetry, and synchronization metadata;
+- validation and file-descriptor duplication for native consumers;
+- leases, fan-out, release, and consumer-session ownership primitives;
+- optional Rustler, EGL, and Vulkan integration APIs.
+
+These primitives let programmers build zero-copy GPU pipelines in Elixir with
+producer and consumer elements written in Rust. Framework adapters carry the
+same `%VideoInterop.Frame{}` values without replacing the storage or ownership
+contract. The `membrane_video_interop` library exposes that contract through
+Membrane source and sink elements.
 
 VideoInterop does not allocate buffers, initialize a graphics API, render, or
-choose how frames travel through an application.
+select an application transport.
 
 ## Project status
 
@@ -39,15 +64,15 @@ def deps do
 end
 ```
 
-Native code can use the Rust crate directly:
+Use the Rust crate directly in native code:
 
 ```toml
 [dependencies]
 video-interop = "0.1"
 ```
 
-The crate enables Rustler support by default. A Rust-only consumer can turn it
-off:
+The crate enables Rustler support by default. Disable it for a Rust-only
+consumer:
 
 ```toml
 video-interop = { version = "0.1", default-features = false }
@@ -120,9 +145,9 @@ format = %VideoInterop.Format{
 :ok = VideoInterop.validate(frame, format)
 ```
 
-`Object.size` is the complete allocation size reported by the DMA-BUF fd. It
-may be larger than the bytes used by the image planes because an exporter can
-add alignment or driver padding.
+`Object.size` is the complete allocation size reported by the DMA-BUF fd. The
+size includes any exporter alignment and driver padding outside the bytes
+addressed by the image planes.
 
 Timestamps belong to the transport that carries the frame, so they are not part
 of `%VideoInterop.Frame{}`.
@@ -276,7 +301,7 @@ scripts/check-vulkan-shaders.sh
 scripts/check-release-artifact-parity.sh
 ```
 
-Maintainers can follow the
+Maintainers follow the
 [release checklist](https://github.com/emerge-elixir/video_interop/blob/main/RELEASING.md)
 for package checks and publication order.
 

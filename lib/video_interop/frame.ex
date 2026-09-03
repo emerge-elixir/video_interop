@@ -1,10 +1,10 @@
 defmodule VideoInterop.Frame do
   @moduledoc """
-  One storage-neutral video frame.
+  One video frame backed by an owned BEAM binary or borrowed DMA-BUF storage.
 
-  Binary storage owns its immutable BEAM binary and has no lease. Borrowed or
-  reusable storage such as DMA-BUF carries a producer lifetime lease.
-  Timestamps belong to the transport using the frame.
+  Binary storage owns its immutable bytes and has no lease. DMA-BUF storage
+  carries synchronization metadata and a producer lifetime lease. Timestamps
+  belong to the transport using the frame.
   """
 
   alias VideoInterop.{Binary, Format, Lease, Rect, SyncFile}

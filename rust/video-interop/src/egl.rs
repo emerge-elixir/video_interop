@@ -194,7 +194,7 @@ pub fn has_extension(extensions: &str, wanted: &str) -> bool {
 impl NativeFenceFunctions {
     /// Load native-fence entry points without creating a link-time EGL dependency.
     ///
-    /// `load` should try both the EGL shared-library symbol table and
+    /// `load` must try both the EGL shared-library symbol table and
     /// `eglGetProcAddress`. Loading does not select or mix an ABI; callers must
     /// use [`NativeFenceFunctionLoader::select_producer`] or
     /// [`NativeFenceFunctionLoader::select_consumer`] after querying the active

@@ -1,13 +1,33 @@
 # video-interop
 
-`video-interop` provides Rust types for owned binary and borrowed Linux video frames.
+## The problem
 
-It describes binary bytes and strides, DMA-BUF objects and planes, sync-file
-acquire fences, frame geometry, and stream formats. Optional modules connect
-those types to Rustler, EGL, and Vulkan.
+A Rust producer and consumer in a zero-copy Linux GPU pipeline exchange DMA-BUF
+file descriptors instead of copying frame pixels through CPU memory. Each
+handoff also requires image layout, format, geometry, colorimetry,
+synchronization, file-descriptor ownership, and producer-buffer lifetime.
 
-The crate does not allocate buffers, create a renderer, or choose a streaming
-framework.
+An integer file descriptor does not encode those properties and does not own the
+underlying allocation. Rust code must duplicate borrowed descriptors before
+retaining them beyond the current native call, then release each producer lease
+exactly once after GPU use finishes.
+
+## The solution
+
+The `video-interop` crate provides the Rust types and lifecycle primitives for
+the VideoInterop contract. It describes owned binary frames, borrowed Linux
+DMA-BUF frames, sync-file acquire fences, frame geometry, colorimetry, and stream
+formats. Prepared and claimed frame types establish the ownership boundary
+between Elixir and native queues.
+
+The default Rustler integration maps these types to the `video_interop` Hex
+package. This shared contract connects producer and consumer elements written in
+Rust to pipeline control written in Elixir. Optional EGL and Vulkan modules
+implement synchronization and import operations without taking ownership of the
+caller's graphics runtime.
+
+The crate does not allocate producer buffers, create a renderer, or select a
+streaming framework.
 
 ## Status
 
@@ -24,7 +44,8 @@ Rustler support is enabled by default:
 video-interop = "0.1"
 ```
 
-A native program that only needs the frame types can disable it:
+Disable the default feature for a native program that only uses the frame
+types:
 
 ```toml
 [dependencies]
@@ -51,10 +72,10 @@ Call `Descriptor::duplicate_cloexec` before keeping it after the current call.
 The returned `OwnedDescriptor` closes those duplicates when dropped.
 
 `dmabuf_allocation_size` reads the complete allocation size exposed by a
-DMA-BUF fd. This can be larger than the bytes addressed by the image planes due
-to exporter alignment or driver padding. Producers should put this size in
-`Object::size`. Vulkan imports compare the published size with the fd before
-using it.
+DMA-BUF fd. The reported size includes any exporter alignment and driver
+padding outside the bytes addressed by the image planes. Producers must store
+this size in `Object::size`. Vulkan imports compare the published size with the
+fd before using it.
 
 A sync-file descriptor follows the same rule: it is borrowed until duplicated
 into an owned frame.
@@ -101,9 +122,9 @@ transfer, and release-fence handling.
 Imported images stay in a bounded source cache. With planar preference,
 non-linear NV12 is imported as a transfer-source image and copied plane-for-plane
 into ordinary renderer-owned Y and UV images; linear NV12 uses an imported
-transfer-source buffer. Packed RGBA and BGRA can use a compute copy when a
-producer-linear image cannot be sampled. Copy regions cover image bytes only;
-allocation padding remains mapped but is not copied.
+transfer-source buffer. Packed RGBA and BGRA use a compute copy when the device
+does not support sampling the producer-linear image. Copy regions cover image
+bytes only; allocation padding remains mapped but is not copied.
 
 The caller remains responsible for:
 

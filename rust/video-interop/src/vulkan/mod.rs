@@ -1,8 +1,8 @@
 //! Vulkan DMA-BUF import adapter.
 //!
 //! The module provides DMA-BUF validation, external-memory import, device capability queries, and
-//! acquire/release synchronization. A renderer supplies an already selected Vulkan device and may
-//! wrap [`ImportedDmaBufImage::image`] in its own rendering API.
+//! acquire/release synchronization. A renderer supplies an already selected Vulkan device.
+//! [`ImportedDmaBufImage::image`] exposes the imported handle for renderer integration.
 
 mod capability;
 mod error;
@@ -92,8 +92,8 @@ const STAGED_NV12_OUTPUT_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_
         | vk::ImageUsageFlags::TRANSFER_SRC.as_raw()
         | vk::ImageUsageFlags::TRANSFER_DST.as_raw(),
 );
-// The optimal multi-planar destination is importer-owned and may declare
-// Ganesh's transfer compatibility in addition to the transfer-destination operation that fills it.
+// The optimal multi-planar destination is importer-owned and declares Ganesh transfer
+// compatibility in addition to the transfer-destination operation that fills it.
 const TRANSFER_NV12_OUTPUT_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
     vk::ImageUsageFlags::SAMPLED.as_raw()
         | vk::ImageUsageFlags::TRANSFER_SRC.as_raw()

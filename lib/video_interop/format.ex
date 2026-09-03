@@ -2,10 +2,10 @@ defmodule VideoInterop.Format do
   @moduledoc """
   Framework-neutral video format associated with a sequence of frames.
 
-  `framerate: nil` represents an unknown cadence. The storage-specific format
-  is held in `storage`, allowing future non-DMA-BUF storage without changing
-  the outer video interpretation fields. `acquire_sync` declares whether frames
-  use implicit synchronization, sync files, or a compatibility per-frame mix.
+  `framerate: nil` represents an unknown cadence. `storage` contains the binary
+  or DMA-BUF format separately from the outer video interpretation fields.
+  `acquire_sync` declares implicit synchronization, sync files, or a
+  compatibility per-frame mix.
   """
 
   alias VideoInterop.{Binary, Colorimetry}

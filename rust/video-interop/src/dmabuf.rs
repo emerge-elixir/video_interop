@@ -18,8 +18,9 @@ pub(crate) struct DmaBufProbe {
 
 /// Returns the complete allocation size exposed by a DMA-BUF fd.
 ///
-/// This is not a visible image or plane span. Exporters may include alignment padding after the
-/// final addressable plane byte. A descriptor must report the complete size returned by the fd.
+/// This is not a visible image or plane span. The allocation size includes any exporter alignment
+/// padding outside the final addressable plane byte. A descriptor must report the complete size
+/// returned by the fd.
 pub fn dmabuf_allocation_size(fd: RawFd) -> Result<u64, DmaBufAllocationSizeError> {
     probe_dmabuf(fd).map(|probe| probe.allocation_size)
 }

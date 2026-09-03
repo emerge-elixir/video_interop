@@ -4,21 +4,22 @@ defmodule VideoInterop.Lease do
 
   A lease holder is unique. Before fan-out, a splitter must synchronously call
   `retain/2` for every additional branch and give each branch a different
-  returned lease. The producer registers the new holder as pending before acknowledging
-  the retain request. The caller then confirms receipt. It must process retain/confirm/cancel
-  messages in mailbox order; a timeout sends
-  `{:video_interop_cancel_retain, token, child_holder}` to remove a possibly late
-  registration. Releases are idempotent per
-  `{token, holder}` pair.
+  returned lease. The producer registers the new holder as pending before
+  acknowledging the retain request. The caller then confirms receipt. It must
+  process retain/confirm/cancel messages in mailbox order; a timeout sends
+  `{:video_interop_cancel_retain, token, child_holder}` to cancel the child
+  registration. Releases are idempotent per `{token, holder}` pair.
 
-  Producers should issue managed leases through `VideoInterop.LeaseOwner`, whose isolated
-  mailbox prevents media traffic in the producing element from delaying retirement. `new/2` is a
-  low-level unmanaged constructor for implementations that provide equivalent registration,
-  isolation, idempotency, and draining themselves.
+  Use `VideoInterop.LeaseOwner` for managed leases. Its isolated mailbox prevents
+  media traffic in the producing element from delaying retirement. Use `new/2`
+  only in implementations that provide equivalent registration, isolation,
+  idempotency, and draining.
 
-  The opaque backend token should provide an owner-crash destructor fallback. A producer may also
-  attach a unique `VideoInterop.AbandonmentGuard` authority envelope to each holder. Its verified
-  native resource destructor is an eventual fallback for a holder-bearing BEAM term that disappears
+  The opaque backend token must provide an owner-crash destructor fallback. For
+  holder-specific abandonment fallback, attach one unique
+  `VideoInterop.AbandonmentGuard` producer authority envelope to each holder.
+  The guard's verified native resource destructor provides an eventual fallback
+  for a holder-bearing BEAM term that disappears
   without an explicit release. Normal release remains the primary path.
   """
 
@@ -43,8 +44,9 @@ defmodule VideoInterop.Lease do
   @doc """
   Creates an unmanaged root lease.
 
-  Prefer `VideoInterop.LeaseOwner.issue/3`. This constructor does not register the holder or
-  provide mailbox isolation, fan-out accounting, release callbacks, or shutdown draining.
+  Use `VideoInterop.LeaseOwner.issue/3` for managed leases. This constructor
+  does not register the holder or provide mailbox isolation, fan-out accounting,
+  release callbacks, or shutdown draining.
   """
   @spec new(pid(), term()) :: t()
   def new(owner, token) when is_pid(owner),

@@ -339,8 +339,8 @@ impl<D: VulkanDeviceContext> ImportedImageSync<D> {
     }
 
     /// Polls the staged conversion/source-release submission. A true result proves that the
-    /// producer DMA-BUF has been returned to the external queue family and its lease may
-    /// retire even while the renderer-native output remains displayed.
+    /// producer DMA-BUF has returned to the external queue family and permits lease retirement
+    /// while the renderer-native output remains displayed.
     pub fn source_release_complete(&self) -> Result<bool, ImportedImageSyncError> {
         if !self.acquire_submitted {
             return Err(ImportedImageSyncError::new(
@@ -591,7 +591,7 @@ impl<D: VulkanDeviceContext> Drop for ImportedImageSync<D> {
             false
         };
         if !safe_to_destroy {
-            // Submission or renderer use may still reference every child below. Individual
+            // Safe completion has not been established for the child resources below. Individual
             // destruction would violate Vulkan lifetime rules. Quarantine the complete device and
             // intentionally leave these raw handles for vkDestroyDevice.
             self.device.mark_device_lost();

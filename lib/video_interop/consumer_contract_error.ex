@@ -2,8 +2,8 @@ defmodule VideoInterop.ConsumerContractError do
   @moduledoc """
   Raised when trusted consumer code violates the ownership receipt contract.
 
-  `ownership: :unknown` means callers must not guess by releasing the frame,
-  because the implementation may already have claimed it.
+  `ownership: :unknown` forbids the caller from releasing the frame. The
+  violated contract does not establish whether the implementation claimed it.
   """
 
   defexception [:operation, :result, :kind, :reason, :stacktrace, ownership: :unknown]

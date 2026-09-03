@@ -3,7 +3,7 @@ defmodule VideoInterop.Colorimetry do
   Video color interpretation associated with a video stream.
 
   Values default to `:unspecified`; producers must not guess a matrix or range.
-  Importers may reject unspecified values when correct conversion requires them.
+  Importers that require exact conversion reject unspecified values.
   """
 
   defstruct primaries: :unspecified,

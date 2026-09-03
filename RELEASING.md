@@ -73,8 +73,8 @@ cargo publish -p video-interop --dry-run
 
 The Hex package must not contain `_build`, `deps`, `target`, `priv/native`,
 compiled NIFs, BEAM files, or credentials. It must contain the Elixir source and
-`rust/video-interop` production source. The Cargo package may also contain its
-Rust integration tests.
+`rust/video-interop` production source. Rust integration tests are permitted in
+the Cargo package.
 
 Compile the unpacked Hex package:
 

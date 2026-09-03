@@ -1,13 +1,19 @@
 defmodule VideoInterop do
   @moduledoc """
-  Framework-neutral video frame interoperability contract.
+  Video frame and ownership contract for Rust and Elixir.
 
-  Version 0.1 describes owned BEAM binary storage, borrowed Linux DMA-BUF
-  storage, optional acquire sync-file fences, producer leases, and
-  ownership-aware consumer streams. Binary frames use implicit synchronization
-  and no lease. File descriptor integers in Elixir are borrowed and local to one
-  OS process. Native consumers must validate and duplicate every descriptor
-  before retaining it asynchronously.
+  A GPU-bound DMA-BUF frame requires image layout, synchronization, and lifetime
+  metadata in addition to its file descriptors. Copying its pixels into a BEAM
+  binary breaks zero-copy operation.
+
+  VideoInterop provides the shared representation for passing complete DMA-BUF
+  frames between native Rust producers and consumers through Elixir. Version 0.1
+  defines owned BEAM binary storage, borrowed Linux DMA-BUF storage, acquire
+  sync-file fences, producer leases, and ownership-aware consumer streams.
+
+  Binary frames use implicit synchronization and no lease. File descriptor
+  integers in Elixir are borrowed and local to one OS process. Native consumers
+  must validate and duplicate every descriptor before asynchronous retention.
   """
 
   alias VideoInterop.{Consumer, ConsumerContractError, ConsumerSession, Format, Frame, Lease}

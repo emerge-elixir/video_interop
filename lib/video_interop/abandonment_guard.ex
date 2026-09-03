@@ -5,7 +5,7 @@ defmodule VideoInterop.AbandonmentGuard do
   The BEAM represents both ordinary references and native resource references as
   references, so `is_reference/1` cannot prove that a value has a destructor.
   This envelope names the producer authority that registered the native
-  resource. A transport can call `valid?/1` before accepting it. The authority
+  resource. A transport must call `valid?/1` before accepting it. The authority
   must decode its own Rustler resource type and return `true`.
 
   Authorities are trusted local code, not a sandbox boundary. The callback must

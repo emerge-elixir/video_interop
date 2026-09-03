@@ -2,9 +2,9 @@ defmodule VideoInterop.LeaseOwner do
   @moduledoc """
   Isolated owner process for producer-backed video interop leases.
 
-  One owner should be started per producing element or native buffer pool. Its
-  mailbox is reserved for lease lifecycle messages so media traffic in the
-  producer cannot delay buffer retirement.
+  Start one owner per producing element or native buffer pool. Its mailbox is
+  reserved for lease lifecycle messages, so media traffic in the producer does
+  not delay buffer retirement.
 
   Issuance has an explicit ownership boundary. Capacity is reserved before the
   backend token is sent. The caller owns the token until the reservation is
@@ -19,11 +19,12 @@ defmodule VideoInterop.LeaseOwner do
   alive and retryable after producer death or retry exhaustion; there is no
   implicit fatal policy based on observer liveness.
 
-  A producer-supplied `abandonment_guard_factory` may attach one unique,
-  authority-validated native resource envelope to every root and retained holder.
-  Guard construction is transactional: no holder is published when construction fails. Guard
-  destructor messages are fallback releases with separate abandonment
-  accounting and are idempotent with the deterministic explicit release path.
+  A configured `abandonment_guard_factory` attaches one unique,
+  authority-validated native resource envelope to every root and retained
+  holder. Guard construction is transactional: no holder is published when
+  construction fails. Guard destructor messages are fallback releases with
+  separate abandonment accounting and are idempotent with the deterministic
+  explicit release path.
   Ordered release tombstones are bounded; releases older than retained history
   are reported as unclassified instead of being guessed to be duplicates.
   """
@@ -92,8 +93,8 @@ defmodule VideoInterop.LeaseOwner do
   @doc """
   Starts a lease owner linked to the producing process.
 
-  This intentionally uses an ordinary link rather than an OTP parent link so the
-  owner can trap producer exit and outlive it until every lease drains.
+  This intentionally uses an ordinary link rather than an OTP parent link. The
+  owner traps producer exit and outlives it until every lease drains.
   `release_retry` defaults to `:manual`. Automatic exponential retry requires an
   idempotent release callback. Before stopping after successful drainage, the
   owner sends its final stats followed by the two-field drained notification.
@@ -138,7 +139,7 @@ defmodule VideoInterop.LeaseOwner do
   boundary; every later timeout, release failure, or owner death is a
   `:transferred` error.
 
-  Because a local PID can die concurrently with send, backend tokens must also
+  A local PID death races with message delivery, so backend tokens must also
   have an owner-crash/message-drop destructor fallback.
   """
   @spec issue(pid(), term(), keyword()) :: {:ok, Lease.t()} | {:error, ownership_error()}
@@ -161,7 +162,7 @@ defmodule VideoInterop.LeaseOwner do
   Stops admission and waits for all holders and release callbacks.
 
   A timeout removes only this waiter and leaves the owner draining. A failed
-  final callback returns its public token so `retry/3` can address it.
+  final callback returns its public token for a subsequent `retry/3` call.
   """
   @spec drain(pid(), timeout()) ::
           :ok
@@ -1395,7 +1396,7 @@ defmodule VideoInterop.LeaseOwner do
   @impl true
   def handle_continue(:discard_published_guard_reply, state) do
     # Sending a resource term copies it into the recipient's message queue, but the sender's
-    # process heap can keep its copy until a later garbage collection. Run this continuation
+    # process heap keeps its copy until a later garbage collection. Run this continuation
     # before accepting the confirmation/cancellation message so the LeaseOwner never acts as an
     # accidental guard custodian after publication. A continuation is used rather than collecting
     # inside the publishing callback, where the guard is still a live stack term.

@@ -8,7 +8,7 @@ defmodule VideoInterop.MixProject do
       app: :video_interop,
       version: @version,
       elixir: "~> 1.17",
-      description: "Owned video frame descriptors, synchronization, and leases",
+      description: "Video frame, DMA-BUF, synchronization, and ownership primitives",
       source_url: "https://github.com/emerge-elixir/video_interop",
       homepage_url: "https://github.com/emerge-elixir/video_interop",
       elixirc_paths: elixirc_paths(Mix.env()),
