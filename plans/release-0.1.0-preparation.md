@@ -367,10 +367,12 @@ source commit in the release audit.
    Rustler, EGL, and Vulkan feature combinations.
 8. Configure crates.io trusted publishing for future releases, remove the CI secret, and revoke the
    bootstrap token.
-9. Publish Hex:
+9. After verifying the crates.io package, approve the protected `publish-hex` GitHub Actions job.
+   CI publishes the Hex package and documentation with:
 
    ```bash
-   mix hex.publish
+   mix hex.publish package --yes
+   mix hex.publish docs --yes
    ```
 
 10. In a clean temporary Mix project, fetch `{:video_interop, "== 0.1.0"}`, compile with warnings

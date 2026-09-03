@@ -11,13 +11,14 @@ code downloads it from crates.io.
    manifests.
 3. Confirm that `main` contains every release fix and is not ahead of the remote.
 4. Confirm that crates.io and Hex accounts are available for both package names.
-5. Configure the protected GitHub `crates-io` environment described below.
+5. Configure the protected GitHub `crates-io` and `hex` environments described
+   below.
 6. Set the release date in `CHANGELOG.md`.
 7. Check that both manifests still use version 0.1.0.
 8. Start from a clean checkout without sibling dependency overrides.
 
-Do not publish the Rust crate from a developer workstation. The `publish-crate`
-CI job is the only publication path.
+Do not publish either package from a developer workstation. The `publish-crate`
+and `publish-hex` CI jobs are the only publication paths.
 
 For the first publication, crates.io cannot yet attach a trusted publisher to
 an existing crate. Create a short-lived crates.io API token restricted to the
@@ -26,9 +27,14 @@ as the `CARGO_REGISTRY_TOKEN` environment secret in a GitHub environment named
 `crates-io`. Configure required reviewer approval, prevent administrator bypass
 if available, and restrict deployment to tags matching `v*`.
 
+For Hex, sign in to <https://hex.pm>, verify the publishing account, and create
+a short-lived key from <https://hex.pm/dashboard/keys> with API write
+permission. Store it only as the `HEX_API_KEY` environment secret in a GitHub
+environment named `hex`. Give that environment the same reviewer and `v*` tag
+protections as `crates-io`.
+
 Do not put registry tokens in this repository or in command arguments saved by
-shell history. Configure Hex authentication separately before publishing the
-Hex package.
+shell history.
 
 ## Validate the source
 
@@ -124,13 +130,20 @@ repository `video_interop`, workflow `ci.yml`, and environment `crates-io`.
 Then migrate the CI job to `rust-lang/crates-io-auth-action`, remove the
 long-lived secret, and revoke the bootstrap token.
 
-## Publish Hex
+## Publish Hex through CI
+
+After crates.io accepts and the registry verification passes, approve the
+pending `publish-hex` deployment on the protected `hex` environment. The job
+cannot run until `publish-crate` succeeds. CI rechecks the package and docs,
+then publishes both from the same tag with:
 
 ```sh
-mix hex.publish
+mix hex.publish package --yes
+mix hex.publish docs --yes
 ```
 
-After Hex accepts it, create a temporary Mix project with:
+Do not run those commands locally. After Hex accepts them, create a temporary
+Mix project with:
 
 ```elixir
 {:video_interop, "== 0.1.0"}

@@ -200,7 +200,8 @@ Registry-only downstream validation remains necessarily blocked until both packa
 7. Approve the protected `publish-crate` job so CI publishes `video-interop`.
 8. Fetch `video-interop = "=0.1.0"` from crates.io and test core, default, EGL, and Vulkan features.
 9. Configure crates.io trusted publishing, remove the CI secret, and revoke the bootstrap token.
-10. Run `mix hex.publish` from the same tagged checkout.
+10. Approve the protected `publish-hex` CI job to publish the Hex package and documentation from
+    the same tag.
 11. Fetch `{:video_interop, "== 0.1.0"}` in a clean Mix project and verify compilation and HexDocs.
 12. Create the GitHub release.
 13. Remove downstream path overrides, regenerate locks, and run registry-only Emerge and adapter CI.
