@@ -11,13 +11,24 @@ code downloads it from crates.io.
    manifests.
 3. Confirm that `main` contains every release fix and is not ahead of the remote.
 4. Confirm that crates.io and Hex accounts are available for both package names.
-5. Set the release date in `CHANGELOG.md`.
-6. Check that both manifests still use version 0.1.0.
-7. Start from a clean checkout without sibling dependency overrides.
+5. Configure the protected GitHub `crates-io` environment described below.
+6. Set the release date in `CHANGELOG.md`.
+7. Check that both manifests still use version 0.1.0.
+8. Start from a clean checkout without sibling dependency overrides.
+
+Do not publish the Rust crate from a developer workstation. The `publish-crate`
+CI job is the only publication path.
+
+For the first publication, crates.io cannot yet attach a trusted publisher to
+an existing crate. Create a short-lived crates.io API token restricted to the
+`video-interop` crate name with permission to publish a new crate. Store it only
+as the `CARGO_REGISTRY_TOKEN` environment secret in a GitHub environment named
+`crates-io`. Configure required reviewer approval, prevent administrator bypass
+if available, and restrict deployment to tags matching `v*`.
 
 Do not put registry tokens in this repository or in command arguments saved by
-shell history. Configure Cargo credentials and run `mix hex.user auth` before
-starting.
+shell history. Configure Hex authentication separately before publishing the
+Hex package.
 
 ## Validate the source
 
@@ -86,17 +97,32 @@ git push origin v0.1.0
 Wait for every CI job on `v0.1.0` to pass. Do not publish from a different
 checkout or commit.
 
-## Publish the Rust crate
+## Publish the Rust crate through CI
+
+Pushing `v0.1.0` starts the normal CI matrix. The `publish-crate` job depends on
+all validation jobs and the exact-tag gate, then waits for approval on the
+protected `crates-io` environment. Review the successful prerequisite jobs and
+approve that environment deployment. CI runs:
 
 ```sh
-cargo publish -p video-interop
+cargo publish --locked --package video-interop
 ```
 
-After crates.io accepts it, create a temporary crate that depends on
-`video-interop = "=0.1.0"`. Fetch it from crates.io and compile the default,
-core-only, EGL, and Vulkan feature sets.
+Do not run that command locally and do not upload a separately built archive.
+If the publish job fails before crates.io accepts the crate, fix the issue in a
+new commit and tag a new version; never move a public tag.
 
-Stop if the registry archive differs from the tag.
+After crates.io accepts 0.1.0, create a temporary crate that depends on
+`video-interop = "=0.1.0"`. Fetch it from crates.io and compile the default,
+core-only, EGL, and Vulkan feature sets. Stop if the registry archive differs
+from the tag.
+
+The first release must use the short-lived token because trusted publishing can
+only be configured after the crate exists. After 0.1.0 is published, configure
+the crate's crates.io trusted publisher for organization `emerge-elixir`,
+repository `video_interop`, workflow `ci.yml`, and environment `crates-io`.
+Then migrate the CI job to `rust-lang/crates-io-auth-action`, remove the
+long-lived secret, and revoke the bootstrap token.
 
 ## Publish Hex
 

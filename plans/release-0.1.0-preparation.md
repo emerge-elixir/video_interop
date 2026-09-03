@@ -354,23 +354,28 @@ source commit in the release audit.
    - package validation paths/scripts.
 4. Create signed or annotated tag `v0.1.0` at the clean candidate commit.
 5. Push the commit and tag, then wait for exact-tag CI to pass.
-6. Publish the Rust crate first:
+6. Approve the protected `publish-crate` GitHub Actions job after all validation and exact-tag jobs
+   pass. CI publishes the Rust crate with:
 
    ```bash
-   cargo publish -p video-interop
+   cargo publish --locked --package video-interop
    ```
 
+   For the first publication, provide a short-lived crates.io token through the protected
+   `crates-io` GitHub environment. Do not publish from a developer workstation.
 7. In a clean temporary crate, fetch `video-interop = "=0.1.0"` from crates.io and test core,
    Rustler, EGL, and Vulkan feature combinations.
-8. Publish Hex:
+8. Configure crates.io trusted publishing for future releases, remove the CI secret, and revoke the
+   bootstrap token.
+9. Publish Hex:
 
    ```bash
    mix hex.publish
    ```
 
-9. In a clean temporary Mix project, fetch `{:video_interop, "== 0.1.0"}`, compile with warnings
-   denied, and verify HexDocs.
-10. Create the GitHub release from the same tag with the supported Vulkan scope and platform
+10. In a clean temporary Mix project, fetch `{:video_interop, "== 0.1.0"}`, compile with warnings
+    denied, and verify HexDocs.
+11. Create the GitHub release from the same tag with the supported Vulkan scope and platform
     requirements.
 
 Stop if either artifact differs from the tagged source. Do not publish downstream packages against

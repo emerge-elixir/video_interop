@@ -5,8 +5,8 @@ and credential blockers remain**
 
 Audit date: 2026-09-03
 
-Candidate state: clean release-documentation commit on local `main`. The final dated release commit
-does not exist yet.
+Candidate state: local release work based on `main`. The final pushed and dated release commit does
+not exist yet.
 
 ## Decision
 
@@ -22,13 +22,13 @@ current environment.
 
 ### 1. Final candidate is not pushed
 
-Local `main` is eight commits ahead of `origin/main`. The working tree is clean and includes the
-Vulkan support wording corrections in public docs, release docs, Rust module documentation, and
+Local release commits are not synchronized to `origin/main`. The candidate must include the Vulkan
+support wording, CI-only crates.io publication job, release docs, Rust module documentation, and
 this refreshed audit.
 
 Before release:
 
-1. push the local commits;
+1. commit the final local release changes and push them;
 2. verify `git diff --check` and `git status --short` is empty;
 3. run the complete release matrix from that exact commit.
 
@@ -66,6 +66,11 @@ The tag gate already verifies the tag name, Cargo version, Mix version, and date
 The current environment has no `HEX_API_KEY`, Cargo registry token, GitHub token, Cargo credentials
 file, or authenticated Hex configuration. `mix hex.publish --dry-run` reaches authentication and
 then fails because no Hex user is configured.
+
+The first crates.io publication must run through the protected `publish-crate` CI job. Because the
+crate does not exist yet, bootstrap that job with a short-lived, crate-name-restricted token carrying
+new-crate publication permission in the `crates-io` GitHub environment. Configure trusted
+publishing and revoke the bootstrap token immediately after 0.1.0 exists.
 
 Authenticate outside the repository before the release session. Do not put tokens in files tracked
 by Git or in command arguments retained by shell history.
@@ -187,16 +192,18 @@ Registry-only downstream validation remains necessarily blocked until both packa
 ## Exact remaining sequence
 
 1. Push `main`, make the GitHub repository public, and verify anonymous access.
-2. Run `RELEASING.md` from a clean public clone.
-3. Set the final changelog date and commit it.
-4. Recheck both registry names.
-5. Create and push annotated `v0.1.0`; wait for all tag CI jobs.
-6. Authenticate and run `cargo publish -p video-interop` from the tagged checkout.
-7. Fetch `video-interop = "=0.1.0"` from crates.io and test core, default, EGL, and Vulkan features.
-8. Run `mix hex.publish` from the same tagged checkout.
-9. Fetch `{:video_interop, "== 0.1.0"}` in a clean Mix project and verify compilation and HexDocs.
-10. Create the GitHub release.
-11. Remove downstream path overrides, regenerate locks, and run registry-only Emerge and adapter CI.
+2. Create the protected GitHub `crates-io` environment and its bootstrap token secret.
+3. Run `RELEASING.md` from a clean public clone.
+4. Set the final changelog date and commit it.
+5. Recheck both registry names.
+6. Create and push annotated `v0.1.0`; wait for all validation and exact-tag CI jobs.
+7. Approve the protected `publish-crate` job so CI publishes `video-interop`.
+8. Fetch `video-interop = "=0.1.0"` from crates.io and test core, default, EGL, and Vulkan features.
+9. Configure crates.io trusted publishing, remove the CI secret, and revoke the bootstrap token.
+10. Run `mix hex.publish` from the same tagged checkout.
+11. Fetch `{:video_interop, "== 0.1.0"}` in a clean Mix project and verify compilation and HexDocs.
+12. Create the GitHub release.
+13. Remove downstream path overrides, regenerate locks, and run registry-only Emerge and adapter CI.
 
 ## Release decision
 
