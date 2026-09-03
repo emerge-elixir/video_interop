@@ -96,9 +96,8 @@ The importer stores its construction-time `Nv12StagingPreference`. Resolution fi
 candidate against exact extent, external-memory, filtering, chroma-siting, transfer, and pipeline
 requirements, then selects by policy order:
 
-- `PreferPlanar`: exact direct sampling, then the inventoried staged candidate: optimal
-  multi-planar transfer, separate optimal Y/UV transfer, compute Y/UV, or compute RGBA in that
-  capability-discovery order.
+- `PreferPlanar`: non-linear image-to-optimal Y/UV transfer or linear buffer-to-optimal Y/UV
+  transfer, followed by compute Y/UV and compute RGBA fallbacks in capability-discovery order.
 - `RequirePlanar`: compute Y/UV only.
 - `RequireRgba`: compute RGBA only.
 

@@ -99,11 +99,12 @@ The `vulkan` feature is experimental. It accepts a caller-owned `ash` device and
 provides DMA-BUF capability checks, memory import, sync-file waits, queue-family
 ownership transfer, and release-fence handling.
 
-Directly sampleable images stay in a bounded source cache. Linear NV12 can be
-copied into an optimal multi-planar image or separate Y and UV images. Packed
-RGBA and BGRA can use a compute copy when a producer-linear image cannot be
-sampled. Copy regions cover image bytes only; allocation padding remains mapped
-but is not copied.
+Imported images stay in a bounded source cache. With planar preference,
+non-linear NV12 is imported as a transfer-source image and copied plane-for-plane
+into ordinary renderer-owned Y and UV images; linear NV12 uses an imported
+transfer-source buffer. Packed RGBA and BGRA can use a compute copy when a
+producer-linear image cannot be sampled. Copy regions cover image bytes only;
+allocation padding remains mapped but is not copied.
 
 The caller remains responsible for:
 

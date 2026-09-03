@@ -81,10 +81,12 @@ const DIRECT_PACKED_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
         | vk::ImageUsageFlags::TRANSFER_DST.as_raw(),
 );
 const DIRECT_NV12_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::SAMPLED;
-// Ganesh rejects wrapped Vulkan textures unless both transfer bits are declared, even when it
-// only samples them. These are importer-owned optimal output images with Vulkan-sized local
-// allocations, not camera DMA-BUFs, so declaring transfer compatibility cannot expose the
-// producer allocation to V3D TFU read-ahead.
+// Non-linear decoder allocations cannot be treated as raw buffers. Import them only as
+// transfer-source images, then copy their planes into ordinary renderer-owned optimal images.
+const DIRECT_NV12_PLANE_TRANSFER_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::TRANSFER_SRC;
+// These are importer-owned optimal output images with Vulkan-sized local allocations, not camera
+// DMA-BUFs, so declaring Ganesh's transfer compatibility cannot expose producer allocations to
+// renderer read-ahead.
 const STAGED_NV12_OUTPUT_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
     vk::ImageUsageFlags::SAMPLED.as_raw()
         | vk::ImageUsageFlags::STORAGE.as_raw()
@@ -250,6 +252,10 @@ pub struct Nv12FrameTopology {
 pub enum Nv12ImportStrategy {
     /// The DMA-BUF allocation is directly sampled as a multiplanar Vulkan image.
     DirectSampledImage,
+    /// A non-linear DMA-BUF is imported as a transfer-source image and copied plane-for-plane into
+    /// ordinary optimal `R8_UNORM` and `R8G8_UNORM` renderer images. This avoids requiring Ganesh
+    /// to wrap a multi-planar image while preserving exact YUV conversion in the renderer.
+    DirectImageToOptimalYuvPlanes,
     /// Linear NV12 is imported as a transfer-source buffer and copied plane-for-plane into one
     /// optimal multi-planar NV12 image. Vulkan sampler YCbCr conversion remains deferred to the
     /// renderer, so no RGB intermediate is produced.
@@ -266,16 +272,16 @@ pub enum Nv12ImportStrategy {
     LinearBufferToRgba,
 }
 
-/// Renderer policy for linear NV12 when direct sampling is unavailable.
+/// Renderer policy for NV12 import and staging.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Nv12StagingPreference {
-    /// Prefer a plane-for-plane transfer into optimal multi-planar NV12, then separate optimal
-    /// Y/UV planes when exact hardware YCbCr filtering is unavailable, then compute Y/UV planes.
-    /// Use exact compute RGBA only when no planar path is available.
+    /// Preserve Y and UV in separate renderer-owned images. Non-linear sources are imported as
+    /// transfer-source images; linear sources are imported as transfer-source buffers. Compute
+    /// Y/UV and RGBA remain ordered fallbacks when exact plane copies are unavailable.
     #[default]
     PreferPlanar,
     /// Require the established compute Y/UV-plane path. This remains the explicit rollback and
-    /// qualification mode while `auto` evaluates the faster multi-planar transfer path.
+    /// qualification mode for devices whose transfer path is not yet qualified.
     RequirePlanar,
     /// Require exact compute RGBA output; never silently change the benchmarked path.
     RequireRgba,
@@ -284,6 +290,7 @@ pub enum Nv12StagingPreference {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Nv12AllocationBindingRecipe {
     DirectSharedImage,
+    DirectImageToOptimalYuvPlanes,
     LinearBufferToOptimalNv12,
     LinearBufferToOptimalYuvPlanes,
     LinearBufferToYuvPlanes,
@@ -294,6 +301,9 @@ impl Nv12ImportStrategy {
     pub fn allocation_recipe(self) -> Nv12AllocationBindingRecipe {
         match self {
             Self::DirectSampledImage => Nv12AllocationBindingRecipe::DirectSharedImage,
+            Self::DirectImageToOptimalYuvPlanes => {
+                Nv12AllocationBindingRecipe::DirectImageToOptimalYuvPlanes
+            }
             Self::LinearBufferToOptimalNv12 => {
                 Nv12AllocationBindingRecipe::LinearBufferToOptimalNv12
             }
@@ -600,6 +610,44 @@ pub fn validate_nv12_modifier_capability(
                 return Err(format!(
                     "Vulkan NV12 modifier {:#018x} lacks required direct sampling/filter/siting features 0x{:x} (available=0x{:x})",
                     capability.modifier,
+                    required.as_raw(),
+                    capability.sampled_tiling_features.as_raw()
+                ));
+            }
+        }
+        Nv12ImportStrategy::DirectImageToOptimalYuvPlanes => {
+            if capability.modifier == DRM_FORMAT_MOD_LINEAR {
+                return Err(
+                    "Vulkan direct-image NV12 transfer requires a non-linear modifier".to_string(),
+                );
+            }
+            if capability.modifier_plane_count != 2 {
+                return Err(format!(
+                    "Vulkan NV12 modifier {:#018x} reports {} memory plane(s), expected exactly two for direct-image transfer",
+                    capability.modifier, capability.modifier_plane_count
+                ));
+            }
+            if conversion.model != YcbcrModel::Bt709 {
+                return Err(
+                    "Vulkan direct-image NV12 transfer currently requires BT.709".to_string(),
+                );
+            }
+            if !capability
+                .source_tiling_features
+                .contains(vk::FormatFeatureFlags::TRANSFER_SRC)
+            {
+                return Err(
+                    "Vulkan direct-image NV12 transfer lacks transfer-source format support"
+                        .to_string(),
+                );
+            }
+            let required = vk::FormatFeatureFlags::SAMPLED_IMAGE
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
+                | vk::FormatFeatureFlags::TRANSFER_SRC
+                | vk::FormatFeatureFlags::TRANSFER_DST;
+            if !capability.sampled_tiling_features.contains(required) {
+                return Err(format!(
+                    "Vulkan optimal YUV-plane output lacks required transfer/sampling/filter features 0x{:x} (available=0x{:x})",
                     required.as_raw(),
                     capability.sampled_tiling_features.as_raw()
                 ));
@@ -1496,6 +1544,48 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
                     dimensions, layout, conversion, capability, source,
                 )
             }
+            Nv12ImportStrategy::DirectImageToOptimalYuvPlanes => {
+                let topology = layout.frame_topology(dimensions);
+                let source = self.claim_cached_source(
+                    stream_incarnation,
+                    source_fd,
+                    topology,
+                    capability.strategy,
+                    || {
+                        let sampled = create_direct_image(
+                            Arc::clone(&self.device),
+                            dimensions,
+                            source_fd,
+                            layout.modifier,
+                            &layout.planes,
+                            IMPORTED_NV12_FORMAT,
+                            DIRECT_NV12_PLANE_TRANSFER_USAGE,
+                            Some(layout.object_size),
+                        )
+                        .map_err(|error| error.to_string())?;
+                        Ok(CachedNv12Source {
+                            allocation: CachedNv12SourceAllocation::Direct { sampled },
+                            claimed: AtomicBool::new(false),
+                            last_used: AtomicU64::new(0),
+                        })
+                    },
+                )?;
+                let output = self.claim_nv12_output(dimensions, capability.strategy, None, None)?;
+                Ok(ImportedDmaBufImage {
+                    id: next_import_id(),
+                    kind: ImportedKind::StagedNv12(StagedNv12 {
+                        source,
+                        output,
+                        operation: StagedNv12Operation::ImageTransfer,
+                        conversion,
+                        format_features: capability.sampled_tiling_features,
+                    }),
+                    dimensions,
+                    modifier: layout.modifier,
+                    sampled_usage: TRANSFER_NV12_OUTPUT_USAGE,
+                    sampled_tiling: vk::ImageTiling::OPTIMAL,
+                })
+            }
             Nv12ImportStrategy::LinearBufferToOptimalNv12
             | Nv12ImportStrategy::LinearBufferToOptimalYuvPlanes => {
                 self.create_staged_nv12(StagedNv12Import {
@@ -1715,8 +1805,9 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
             | Nv12ImportStrategy::LinearBufferToRgba => {
                 validate_staged_layout(self.device.as_ref(), dimensions, layout)?;
             }
-            Nv12ImportStrategy::DirectSampledImage => {
-                return Err("direct NV12 import cannot use staged construction".to_string());
+            Nv12ImportStrategy::DirectSampledImage
+            | Nv12ImportStrategy::DirectImageToOptimalYuvPlanes => {
+                return Err("direct NV12 import cannot use buffer-staged construction".to_string());
             }
         }
         let topology = layout.frame_topology(dimensions);
@@ -1740,28 +1831,8 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
                 )
             })?;
         let source_view = source.source.allocation.compute_view();
-        let output = {
-            let mut pool = self
-                .nv12_output_pool
-                .lock()
-                .map_err(|_| "Vulkan NV12 output-pool lock poisoned".to_string())?;
-            match pool.claim(
-                Arc::clone(&self.device),
-                dimensions,
-                strategy,
-                pipeline.as_deref(),
-                source_view,
-            ) {
-                Ok(output) => output,
-                Err(error) => {
-                    if matches!(error, VulkanImportError::PoolSaturated { .. }) {
-                        self.output_pool_busy_rejections
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    return Err(error.to_string());
-                }
-            }
-        };
+        let output =
+            self.claim_nv12_output(dimensions, strategy, pipeline.as_deref(), source_view)?;
         create_staged_nv12(
             dimensions,
             layout,
@@ -1772,6 +1843,35 @@ impl<D: VulkanDeviceContext> VulkanDmaBufImporter<D> {
             strategy,
             sampled_format_features,
         )
+    }
+
+    fn claim_nv12_output(
+        &self,
+        dimensions: (u32, u32),
+        strategy: Nv12ImportStrategy,
+        pipeline: Option<&Nv12ComputePipeline<D>>,
+        source_view: Option<vk::BufferView>,
+    ) -> Result<Nv12OutputLease<D>, String> {
+        let mut pool = self
+            .nv12_output_pool
+            .lock()
+            .map_err(|_| "Vulkan NV12 output-pool lock poisoned".to_string())?;
+        match pool.claim(
+            Arc::clone(&self.device),
+            dimensions,
+            strategy,
+            pipeline,
+            source_view,
+        ) {
+            Ok(output) => Ok(output),
+            Err(error) => {
+                if matches!(error, VulkanImportError::PoolSaturated { .. }) {
+                    self.output_pool_busy_rejections
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(error.to_string())
+            }
+        }
     }
 }
 
@@ -2130,9 +2230,10 @@ enum StagedNv12Operation<D: VulkanDeviceContext> {
         pipeline: Arc<Nv12ComputePipeline<D>>,
         push_constants: Nv12PushConstants,
     },
-    Transfer {
+    BufferTransfer {
         layout: Nv12SharedObjectLayout,
     },
+    ImageTransfer,
 }
 
 struct StagedNv12<D: VulkanDeviceContext> {
@@ -2437,18 +2538,18 @@ impl<D: VulkanDeviceContext> ImportedDmaBufImage<D> {
                     ),
                 })
             }
-            ImportedKind::StagedNv12(staged) => {
-                let source = staged
-                    .source
-                    .source
-                    .allocation
-                    .source()
-                    .expect("staged NV12 import owns a source buffer");
-                match &staged.operation {
-                    StagedNv12Operation::Compute {
-                        pipeline,
-                        push_constants,
-                    } => AcquirePlan::StagedCompute(StagedAcquirePlan {
+            ImportedKind::StagedNv12(staged) => match &staged.operation {
+                StagedNv12Operation::Compute {
+                    pipeline,
+                    push_constants,
+                } => {
+                    let source = staged
+                        .source
+                        .source
+                        .allocation
+                        .source()
+                        .expect("compute NV12 import owns a source buffer");
+                    AcquirePlan::StagedCompute(StagedAcquirePlan {
                         source_buffer: source.buffer,
                         source_size: source.size,
                         output: staged.output.slot.sampled_images(),
@@ -2465,23 +2566,40 @@ impl<D: VulkanDeviceContext> ImportedDmaBufImage<D> {
                             (self.dimensions.0 / 2).div_ceil(16),
                             (self.dimensions.1 / 2).div_ceil(16),
                         ),
-                    }),
-                    StagedNv12Operation::Transfer { layout } => {
-                        AcquirePlan::StagedTransfer(StagedTransferPlan {
-                            source_buffer: source.buffer,
-                            source_size: source.size,
-                            output: staged.output.slot.sampled_images(),
-                            output_initialized: staged
-                                .output
-                                .slot
-                                .initialized
-                                .load(Ordering::Acquire),
-                            dimensions: self.dimensions,
-                            planes: layout.planes,
-                        })
-                    }
+                    })
                 }
-            }
+                StagedNv12Operation::BufferTransfer { layout } => {
+                    let source = staged
+                        .source
+                        .source
+                        .allocation
+                        .source()
+                        .expect("transfer NV12 import owns a source buffer");
+                    AcquirePlan::StagedTransfer(StagedTransferPlan {
+                        source_buffer: source.buffer,
+                        source_size: source.size,
+                        output: staged.output.slot.sampled_images(),
+                        output_initialized: staged.output.slot.initialized.load(Ordering::Acquire),
+                        dimensions: self.dimensions,
+                        planes: layout.planes,
+                    })
+                }
+                StagedNv12Operation::ImageTransfer => {
+                    let source_image = match &staged.source.source.allocation {
+                        CachedNv12SourceAllocation::Direct { sampled } => sampled.image,
+                        CachedNv12SourceAllocation::Compute { .. }
+                        | CachedNv12SourceAllocation::Transfer { .. } => {
+                            unreachable!("direct-image NV12 transfer owns an imported image")
+                        }
+                    };
+                    AcquirePlan::StagedImageTransfer(StagedImageTransferPlan {
+                        source_image,
+                        output: staged.output.slot.sampled_images(),
+                        output_initialized: staged.output.slot.initialized.load(Ordering::Acquire),
+                        dimensions: self.dimensions,
+                    })
+                }
+            },
             ImportedKind::DirectPacked(source) => match &source.source.allocation {
                 PackedSourceAllocation::Direct(allocation) => AcquirePlan::DirectImage {
                     image: allocation.image,
@@ -2511,6 +2629,7 @@ pub(super) enum AcquirePlan {
     DirectImage { image: vk::Image },
     StagedCompute(StagedAcquirePlan),
     StagedTransfer(StagedTransferPlan),
+    StagedImageTransfer(StagedImageTransferPlan),
 }
 
 #[derive(Clone, Copy)]
@@ -2534,6 +2653,14 @@ pub(super) struct StagedTransferPlan {
     pub output_initialized: bool,
     pub dimensions: (u32, u32),
     pub planes: [ImportedPlane; 2],
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct StagedImageTransferPlan {
+    pub source_image: vk::Image,
+    output: StagedSampledImages,
+    pub output_initialized: bool,
+    pub dimensions: (u32, u32),
 }
 
 #[derive(Clone, Copy)]
@@ -3063,7 +3190,8 @@ fn create_cached_nv12_source<D: VulkanDeviceContext>(
             };
             CachedNv12SourceAllocation::Compute { view, source }
         }
-        Nv12ImportStrategy::DirectSampledImage => {
+        Nv12ImportStrategy::DirectSampledImage
+        | Nv12ImportStrategy::DirectImageToOptimalYuvPlanes => {
             return Err("direct NV12 image cannot be cached as a source buffer".to_string());
         }
     };
@@ -3134,7 +3262,8 @@ fn create_staged_output_slot<D: VulkanDeviceContext>(
 ) -> Result<StagedOutputSlot<D>, String> {
     if matches!(
         strategy,
-        Nv12ImportStrategy::LinearBufferToOptimalNv12
+        Nv12ImportStrategy::DirectImageToOptimalYuvPlanes
+            | Nv12ImportStrategy::LinearBufferToOptimalNv12
             | Nv12ImportStrategy::LinearBufferToOptimalYuvPlanes
     ) {
         if pipeline.is_some() || source_view.is_some() {
@@ -3150,7 +3279,8 @@ fn create_staged_output_slot<D: VulkanDeviceContext>(
                 )?;
                 StagedOutputResources::Nv12 { sampled }
             }
-            Nv12ImportStrategy::LinearBufferToOptimalYuvPlanes => {
+            Nv12ImportStrategy::DirectImageToOptimalYuvPlanes
+            | Nv12ImportStrategy::LinearBufferToOptimalYuvPlanes => {
                 let luma = create_local_image(
                     Arc::clone(&device),
                     dimensions,
@@ -3186,8 +3316,9 @@ fn create_staged_output_slot<D: VulkanDeviceContext>(
     let expected_output = match strategy {
         Nv12ImportStrategy::LinearBufferToRgba => Nv12ComputeOutput::Rgba,
         Nv12ImportStrategy::LinearBufferToYuvPlanes => Nv12ComputeOutput::YuvPlanes,
-        Nv12ImportStrategy::DirectSampledImage => {
-            return Err("direct NV12 import cannot allocate a staged output slot".to_string());
+        Nv12ImportStrategy::DirectSampledImage
+        | Nv12ImportStrategy::DirectImageToOptimalYuvPlanes => {
+            return Err("direct NV12 import cannot allocate a compute output slot".to_string());
         }
         Nv12ImportStrategy::LinearBufferToOptimalNv12
         | Nv12ImportStrategy::LinearBufferToOptimalYuvPlanes => unreachable!("handled above"),
@@ -3232,7 +3363,8 @@ fn create_staged_output_slot<D: VulkanDeviceContext>(
                 chroma,
             }
         }
-        Nv12ImportStrategy::DirectSampledImage => unreachable!("validated above"),
+        Nv12ImportStrategy::DirectSampledImage
+        | Nv12ImportStrategy::DirectImageToOptimalYuvPlanes => unreachable!("validated above"),
         Nv12ImportStrategy::LinearBufferToOptimalNv12
         | Nv12ImportStrategy::LinearBufferToOptimalYuvPlanes => unreachable!("handled above"),
     };
@@ -3501,7 +3633,7 @@ fn create_staged_nv12<D: VulkanDeviceContext>(
             if pipeline.is_some() {
                 return Err("Vulkan NV12 transfer unexpectedly owns a compute pipeline".to_string());
             }
-            StagedNv12Operation::Transfer { layout }
+            StagedNv12Operation::BufferTransfer { layout }
         }
         Nv12ImportStrategy::LinearBufferToYuvPlanes | Nv12ImportStrategy::LinearBufferToRgba => {
             let pipeline = pipeline
@@ -3533,8 +3665,9 @@ fn create_staged_nv12<D: VulkanDeviceContext>(
                 push_constants,
             }
         }
-        Nv12ImportStrategy::DirectSampledImage => {
-            return Err("direct NV12 import cannot be constructed as staged".to_string());
+        Nv12ImportStrategy::DirectSampledImage
+        | Nv12ImportStrategy::DirectImageToOptimalYuvPlanes => {
+            return Err("direct NV12 import cannot be constructed as buffer-staged".to_string());
         }
     };
     let sampled_usage = if matches!(

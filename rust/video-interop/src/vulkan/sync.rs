@@ -9,8 +9,8 @@ use std::{
 use ash::vk;
 
 use super::{
-    AcquirePlan, ImportId, ImportedDmaBufImage, StagedAcquirePlan, StagedSampledImages,
-    StagedTransferPlan, VulkanDeviceContext, duplicate_import_fd,
+    AcquirePlan, ImportId, ImportedDmaBufImage, StagedAcquirePlan, StagedImageTransferPlan,
+    StagedSampledImages, StagedTransferPlan, VulkanDeviceContext, duplicate_import_fd,
 };
 
 /// DMA-BUF ownership outside this logical Vulkan device. The core external family is used rather
@@ -324,6 +324,12 @@ impl<D: VulkanDeviceContext> ImportedImageSync<D> {
                 self.timestamp_query.as_ref(),
             ),
             AcquirePlan::StagedTransfer(plan) => record_staged_transfer_acquire(
+                self.device.as_ref(),
+                self.acquire_command,
+                plan,
+                self.timestamp_query.as_ref(),
+            ),
+            AcquirePlan::StagedImageTransfer(plan) => record_staged_image_transfer_acquire(
                 self.device.as_ref(),
                 self.acquire_command,
                 plan,
@@ -1104,6 +1110,171 @@ fn record_staged_transfer_acquire<D: VulkanDeviceContext>(
             &[],
             &[source_release],
             &[],
+        );
+        if let Some(query) = timestamp_query {
+            device.device().cmd_write_timestamp(
+                command,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                query.pool,
+                1,
+            );
+        }
+    }
+    end_command(device, command)
+}
+
+pub(super) fn image_copy_region(
+    source_aspect: vk::ImageAspectFlags,
+    width: u32,
+    height: u32,
+) -> vk::ImageCopy {
+    vk::ImageCopy::default()
+        .src_subresource(
+            vk::ImageSubresourceLayers::default()
+                .aspect_mask(source_aspect)
+                .mip_level(0)
+                .base_array_layer(0)
+                .layer_count(1),
+        )
+        .dst_subresource(
+            vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .mip_level(0)
+                .base_array_layer(0)
+                .layer_count(1),
+        )
+        .extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        })
+}
+
+fn record_staged_image_transfer_acquire<D: VulkanDeviceContext>(
+    device: &D,
+    command: vk::CommandBuffer,
+    plan: StagedImageTransferPlan,
+    timestamp_query: Option<&TimestampQuery>,
+) -> Result<(), String> {
+    let StagedSampledImages::YuvPlanes { luma, chroma } = plan.output else {
+        return Err("Vulkan direct-image NV12 transfer requires separate YUV outputs".to_string());
+    };
+    begin_command(device, command)?;
+    if let Some(query) = timestamp_query {
+        unsafe {
+            device
+                .device()
+                .cmd_reset_query_pool(command, query.pool, 0, 3);
+            device.device().cmd_write_timestamp(
+                command,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                query.pool,
+                0,
+            );
+        }
+    }
+    let source_acquire = color_range(plan.source_image)
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+        .old_layout(vk::ImageLayout::GENERAL)
+        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .src_queue_family_index(DMA_BUF_EXTERNAL_QUEUE_FAMILY)
+        .dst_queue_family_index(device.queue_family_index());
+    let old_layout = if plan.output_initialized {
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+    } else {
+        vk::ImageLayout::UNDEFINED
+    };
+    let old_access = if plan.output_initialized {
+        vk::AccessFlags::SHADER_READ
+    } else {
+        vk::AccessFlags::empty()
+    };
+    let output_acquires = [luma, chroma].map(|image| {
+        color_range(image)
+            .src_access_mask(old_access)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .old_layout(old_layout)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+    });
+    let source_stage = if plan.output_initialized {
+        vk::PipelineStageFlags::FRAGMENT_SHADER
+    } else {
+        vk::PipelineStageFlags::TOP_OF_PIPE
+    };
+    unsafe {
+        device.device().cmd_pipeline_barrier(
+            command,
+            source_stage,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[source_acquire, output_acquires[0], output_acquires[1]],
+        );
+        let luma_region = image_copy_region(
+            vk::ImageAspectFlags::PLANE_0,
+            plan.dimensions.0,
+            plan.dimensions.1,
+        );
+        device.device().cmd_copy_image(
+            command,
+            plan.source_image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            luma,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[luma_region],
+        );
+        let chroma_region = image_copy_region(
+            vk::ImageAspectFlags::PLANE_1,
+            plan.dimensions.0 / 2,
+            plan.dimensions.1 / 2,
+        );
+        device.device().cmd_copy_image(
+            command,
+            plan.source_image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            chroma,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[chroma_region],
+        );
+    }
+    let output_releases = [luma, chroma].map(|image| {
+        color_range(image)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+    });
+    let source_release = color_range(plan.source_image)
+        .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+        .dst_access_mask(vk::AccessFlags::empty())
+        .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .new_layout(vk::ImageLayout::GENERAL)
+        .src_queue_family_index(device.queue_family_index())
+        .dst_queue_family_index(DMA_BUF_EXTERNAL_QUEUE_FAMILY);
+    unsafe {
+        device.device().cmd_pipeline_barrier(
+            command,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &output_releases,
+        );
+        device.device().cmd_pipeline_barrier(
+            command,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[source_release],
         );
         if let Some(query) = timestamp_query {
             device.device().cmd_write_timestamp(

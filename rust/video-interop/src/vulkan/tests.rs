@@ -1,4 +1,4 @@
-use super::*;
+use super::{sync::image_copy_region, *};
 
 fn color(chroma_location: ChromaLocation) -> Colorimetry {
     Colorimetry {
@@ -204,7 +204,9 @@ fn transfer_capabilities_require_their_exact_sampling_and_transfer_features() {
 }
 
 #[test]
-fn staged_nv12_sources_declare_only_the_selected_read_operation() {
+fn direct_and_staged_nv12_sources_declare_only_the_selected_read_operation() {
+    assert!(DIRECT_NV12_USAGE == vk::ImageUsageFlags::SAMPLED);
+    assert!(DIRECT_NV12_PLANE_TRANSFER_USAGE == vk::ImageUsageFlags::TRANSFER_SRC);
     assert!(STAGED_NV12_SOURCE_USAGE == vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER);
     assert!(STAGED_NV12_SOURCE_TEXEL_FORMAT == vk::Format::R32_UINT);
     assert!(!STAGED_NV12_SOURCE_USAGE.contains(vk::BufferUsageFlags::TRANSFER_SRC));
@@ -625,4 +627,74 @@ fn direct_capability_still_requires_truthful_two_plane_linear_filter_support() {
         },
     };
     assert!(validate_nv12_modifier_capability(capability, (64, 32), conversion).is_err());
+}
+
+#[test]
+fn direct_image_transfer_requires_non_linear_two_plane_transfer_source() {
+    let conversion = map_nv12_colorimetry(color(ChromaLocation::Left)).unwrap();
+    let output_features = vk::FormatFeatureFlags::SAMPLED_IMAGE
+        | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
+        | vk::FormatFeatureFlags::TRANSFER_SRC
+        | vk::FormatFeatureFlags::TRANSFER_DST;
+    let capability = Nv12ModifierCapability {
+        modifier: 7,
+        strategy: Nv12ImportStrategy::DirectImageToOptimalYuvPlanes,
+        modifier_plane_count: 2,
+        source_tiling_features: vk::FormatFeatureFlags::TRANSFER_SRC,
+        sampled_tiling_features: output_features,
+        external_features: vk::ExternalMemoryFeatureFlags::IMPORTABLE,
+        compatible_handle_types: vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+        max_extent: vk::Extent3D {
+            width: 4096,
+            height: 4096,
+            depth: 1,
+        },
+    };
+    assert_eq!(
+        validate_nv12_modifier_capability(capability, (64, 32), conversion),
+        Ok(())
+    );
+    for unsupported in [
+        Nv12ModifierCapability {
+            modifier: DRM_FORMAT_MOD_LINEAR,
+            ..capability
+        },
+        Nv12ModifierCapability {
+            modifier_plane_count: 1,
+            ..capability
+        },
+        Nv12ModifierCapability {
+            source_tiling_features: vk::FormatFeatureFlags::empty(),
+            ..capability
+        },
+        Nv12ModifierCapability {
+            sampled_tiling_features: output_features & !vk::FormatFeatureFlags::TRANSFER_DST,
+            ..capability
+        },
+    ] {
+        assert!(validate_nv12_modifier_capability(unsupported, (64, 32), conversion).is_err());
+    }
+}
+
+#[test]
+fn image_transfer_regions_copy_nv12_planes_to_compatible_output_extents() {
+    let luma = image_copy_region(vk::ImageAspectFlags::PLANE_0, 480, 270);
+    assert!(luma.src_subresource.aspect_mask == vk::ImageAspectFlags::PLANE_0);
+    assert!(luma.dst_subresource.aspect_mask == vk::ImageAspectFlags::COLOR);
+    assert_eq!(
+        (luma.extent.width, luma.extent.height, luma.extent.depth),
+        (480, 270, 1)
+    );
+
+    let chroma = image_copy_region(vk::ImageAspectFlags::PLANE_1, 240, 135);
+    assert!(chroma.src_subresource.aspect_mask == vk::ImageAspectFlags::PLANE_1);
+    assert!(chroma.dst_subresource.aspect_mask == vk::ImageAspectFlags::COLOR);
+    assert_eq!(
+        (
+            chroma.extent.width,
+            chroma.extent.height,
+            chroma.extent.depth
+        ),
+        (240, 135, 1)
+    );
 }

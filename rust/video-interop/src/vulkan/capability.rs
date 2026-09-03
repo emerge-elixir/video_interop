@@ -164,34 +164,51 @@ pub fn inventory_nv12_modifier_capabilities_with_staging_preference<D: VulkanDev
 ) -> Result<Vec<Nv12ModifierCapability>, String> {
     let modifiers = format_modifiers(device, IMPORTED_NV12_FORMAT)?;
     let mut capabilities = if staging_preference == Nv12StagingPreference::PreferPlanar {
+        let output_required = vk::FormatFeatureFlags::SAMPLED_IMAGE
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
+            | vk::FormatFeatureFlags::TRANSFER_SRC
+            | vk::FormatFeatureFlags::TRANSFER_DST;
+        let planar_output = query_transfer_planar_staging_format(device, output_required).ok();
         modifiers
             .iter()
+            .filter(|modifier| modifier.drm_format_modifier != DRM_FORMAT_MOD_LINEAR)
             .filter_map(|modifier| {
+                let (sampled_tiling_features, output_extent) = planar_output?;
+                if modifier.drm_format_modifier_plane_count != 2
+                    || !modifier
+                        .drm_format_modifier_tiling_features
+                        .contains(vk::FormatFeatureFlags::TRANSFER_SRC)
+                {
+                    return None;
+                }
                 query_external_modifier_capability(
                     device,
                     IMPORTED_NV12_FORMAT,
                     modifier.drm_format_modifier,
-                    DIRECT_NV12_USAGE,
+                    DIRECT_NV12_PLANE_TRANSFER_USAGE,
                 )
                 .ok()
                 .filter(|external| {
-                    modifier.drm_format_modifier_plane_count == 2
-                        && external
-                            .external_features
-                            .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+                    external
+                        .external_features
+                        .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
                         && external
                             .compatible_handle_types
                             .contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
                 })
                 .map(|external| Nv12ModifierCapability {
                     modifier: modifier.drm_format_modifier,
-                    strategy: Nv12ImportStrategy::DirectSampledImage,
+                    strategy: Nv12ImportStrategy::DirectImageToOptimalYuvPlanes,
                     modifier_plane_count: modifier.drm_format_modifier_plane_count,
                     source_tiling_features: modifier.drm_format_modifier_tiling_features,
-                    sampled_tiling_features: modifier.drm_format_modifier_tiling_features,
+                    sampled_tiling_features,
                     external_features: external.external_features,
                     compatible_handle_types: external.compatible_handle_types,
-                    max_extent: external.max_extent,
+                    max_extent: vk::Extent3D {
+                        width: external.max_extent.width.min(output_extent.width),
+                        height: external.max_extent.height.min(output_extent.height),
+                        depth: external.max_extent.depth.min(output_extent.depth),
+                    },
                 })
             })
             .collect::<Vec<_>>()
@@ -296,43 +313,15 @@ fn query_linear_nv12_transfer_capability<D: VulkanDeviceContext>(
         TRANSFER_NV12_SOURCE_USAGE,
         "linear NV12 transfer-source buffer",
     )?;
-    let multi_planar_required = vk::FormatFeatureFlags::SAMPLED_IMAGE
+    let required = vk::FormatFeatureFlags::SAMPLED_IMAGE
         | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
-        | vk::FormatFeatureFlags::SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER
-        | vk::FormatFeatureFlags::MIDPOINT_CHROMA_SAMPLES
-        | vk::FormatFeatureFlags::COSITED_CHROMA_SAMPLES
         | vk::FormatFeatureFlags::TRANSFER_SRC
         | vk::FormatFeatureFlags::TRANSFER_DST;
-    let (strategy, sampled_features, max_extent) = match query_optimal_staging_format_with_usage(
-        device,
-        IMPORTED_NV12_FORMAT,
-        multi_planar_required,
-        TRANSFER_NV12_OUTPUT_USAGE,
-        vk::ImageCreateFlags::empty(),
-    ) {
-        Ok((features, extent)) => (
-            Nv12ImportStrategy::LinearBufferToOptimalNv12,
-            features,
-            extent,
-        ),
-        Err(multi_planar_error) => {
-            let required = vk::FormatFeatureFlags::SAMPLED_IMAGE
-                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
-                | vk::FormatFeatureFlags::TRANSFER_SRC
-                | vk::FormatFeatureFlags::TRANSFER_DST;
-            let (features, extent) = query_transfer_planar_staging_format(device, required)
-                    .map_err(|planar_error| {
-                        format!(
-                            "Vulkan NV12 has neither exact multi-planar YCbCr nor separate-plane transfer support: multi_planar={multi_planar_error}; separate_planes={planar_error}"
-                        )
-                    })?;
-            (
-                Nv12ImportStrategy::LinearBufferToOptimalYuvPlanes,
-                features,
-                extent,
-            )
-        }
-    };
+    let (sampled_features, max_extent) = query_transfer_planar_staging_format(device, required)
+        .map_err(|error| {
+            format!("Vulkan NV12 separate-plane transfer output is unavailable: {error}")
+        })?;
+    let strategy = Nv12ImportStrategy::LinearBufferToOptimalYuvPlanes;
     Ok(Nv12ModifierCapability {
         modifier: DRM_FORMAT_MOD_LINEAR,
         strategy,

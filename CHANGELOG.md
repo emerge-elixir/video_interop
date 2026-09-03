@@ -37,8 +37,9 @@ First public release.
 - Add an experimental Vulkan module for DMA-BUF capability checks, memory
   import, sync-file waits, external queue ownership, release fences, and bounded
   import caches.
-- Add fallback paths for linear NV12 and packed RGBA/BGRA when the producer
-  image cannot be sampled directly.
+- Add renderer-owned staging for NV12 and packed RGBA/BGRA when producer
+  allocations cannot be wrapped directly, including plane-for-plane copies from
+  non-linear NV12 images into ordinary optimal Y and UV images.
 - Keep image copy regions separate from allocation padding reported by the
   DMA-BUF fd.
 
