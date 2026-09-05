@@ -26,22 +26,24 @@ pub fn dmabuf_allocation_size(fd: RawFd) -> Result<u64, DmaBufAllocationSizeErro
 }
 
 pub(crate) fn probe_dmabuf(fd: RawFd) -> Result<DmaBufProbe, DmaBufAllocationSizeError> {
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // Keep inode identities and file offsets 64-bit on 32-bit Linux too.
+    let mut stat = std::mem::MaybeUninit::<libc::stat64>::zeroed();
     // SAFETY: `stat` points to writable storage and this call does not take ownership of `fd`.
-    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+    if unsafe { libc::fstat64(fd, stat.as_mut_ptr()) } != 0 {
         return Err(DmaBufAllocationSizeError::Stat(
             std::io::Error::last_os_error(),
         ));
     }
-    // SAFETY: fstat initialized the complete structure after returning success.
+    // SAFETY: fstat64 initialized the complete structure after returning success.
     let stat = unsafe { stat.assume_init() };
 
     // Linux DMA-BUF exporters expose their complete allocation through SEEK_END. Preserve the
     // shared file position when this fd also supports SEEK_CUR/SEEK_SET.
-    let original_position = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
-    let allocation_end = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
+    let original_position = unsafe { libc::lseek64(fd, 0, libc::SEEK_CUR) };
+    let allocation_end = unsafe { libc::lseek64(fd, 0, libc::SEEK_END) };
     let seek_error = (allocation_end < 0).then(std::io::Error::last_os_error);
-    if original_position >= 0 && unsafe { libc::lseek(fd, original_position, libc::SEEK_SET) } < 0 {
+    if original_position >= 0 && unsafe { libc::lseek64(fd, original_position, libc::SEEK_SET) } < 0
+    {
         return Err(DmaBufAllocationSizeError::Restore(
             std::io::Error::last_os_error(),
         ));
@@ -51,7 +53,7 @@ pub(crate) fn probe_dmabuf(fd: RawFd) -> Result<DmaBufProbe, DmaBufAllocationSiz
     }
 
     let allocation_size =
-        u64::try_from(allocation_end).expect("a non-negative off_t always fits in u64");
+        u64::try_from(allocation_end).expect("a non-negative off64_t always fits in u64");
     if allocation_size == 0 {
         return Err(DmaBufAllocationSizeError::Zero);
     }
@@ -59,7 +61,7 @@ pub(crate) fn probe_dmabuf(fd: RawFd) -> Result<DmaBufProbe, DmaBufAllocationSiz
         return Err(DmaBufAllocationSizeError::NegativeStat(stat.st_size));
     }
     if stat.st_size > 0 {
-        let stat_size = u64::try_from(stat.st_size).expect("a positive off_t always fits in u64");
+        let stat_size = u64::try_from(stat.st_size).expect("a positive off64_t always fits in u64");
         if stat_size != allocation_size {
             return Err(DmaBufAllocationSizeError::ProbeMismatch {
                 stat: stat_size,
@@ -348,7 +350,7 @@ mod tests {
         let raw =
             unsafe { libc::memfd_create(c"video-interop-size-test".as_ptr(), libc::MFD_CLOEXEC) };
         assert!(raw >= 0);
-        assert_eq!(unsafe { libc::ftruncate(raw, size) }, 0);
+        assert_eq!(unsafe { libc::ftruncate64(raw, size) }, 0);
         // SAFETY: memfd_create returned one owned descriptor.
         unsafe { OwnedFd::from_raw_fd(raw) }
     }
@@ -358,15 +360,41 @@ mod tests {
     fn allocation_size_reports_complete_size_and_restores_position() {
         let fd = memfd(4_096);
         assert_eq!(
-            unsafe { libc::lseek(fd.as_raw_fd(), 17, libc::SEEK_SET) },
+            unsafe { libc::lseek64(fd.as_raw_fd(), 17, libc::SEEK_SET) },
             17
         );
 
         assert_eq!(dmabuf_allocation_size(fd.as_raw_fd()).unwrap(), 4_096);
         assert_eq!(
-            unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_CUR) },
+            unsafe { libc::lseek64(fd.as_raw_fd(), 0, libc::SEEK_CUR) },
             17
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn allocation_size_and_identity_preserve_large_file_values() {
+        use std::os::unix::fs::MetadataExt;
+
+        let position = i64::from(i32::MAX) + 1;
+        let size = position + 4096;
+        // ftruncate64 creates a sparse memfd; no multi-gigabyte buffer is allocated.
+        let fd = memfd(size);
+        assert_eq!(
+            unsafe { libc::lseek64(fd.as_raw_fd(), position, libc::SEEK_SET) },
+            position
+        );
+
+        let probe = super::probe_dmabuf(fd.as_raw_fd()).unwrap();
+        assert_eq!(probe.allocation_size, size as u64);
+        assert_eq!(
+            unsafe { libc::lseek64(fd.as_raw_fd(), 0, libc::SEEK_CUR) },
+            position
+        );
+
+        let metadata = std::fs::File::from(fd).metadata().unwrap();
+        assert_eq!(probe.device, metadata.dev());
+        assert_eq!(probe.inode, metadata.ino());
     }
 
     #[cfg(target_os = "linux")]

@@ -14,7 +14,7 @@ code downloads it from crates.io.
 5. Configure the protected GitHub `crates-io` and `hex` environments described
    below.
 6. Set the release date in `CHANGELOG.md`.
-7. Check that both manifests still use version 0.1.0.
+7. Check that both manifests still use the same release version.
 8. Start from a clean checkout without sibling dependency overrides.
 
 Do not publish either package from a developer workstation. The `publish-crate`
@@ -66,7 +66,7 @@ scripts/check-release-artifact-parity.sh
 Build and inspect both packages:
 
 ```sh
-mix hex.build --unpack --output /tmp/video_interop-0.1.0
+mix hex.build --unpack --output /tmp/video_interop-0.1.1
 cargo package -p video-interop
 cargo publish -p video-interop --dry-run
 ```
@@ -80,7 +80,7 @@ Compile the unpacked Hex package:
 
 ```sh
 (
-  cd /tmp/video_interop-0.1.0
+  cd /tmp/video_interop-0.1.1
   MIX_ENV=prod mix compile --force --warnings-as-errors
   cargo test --manifest-path rust/video-interop/Cargo.toml --no-default-features
   cargo test --manifest-path rust/video-interop/Cargo.toml --all-features
@@ -88,24 +88,24 @@ Compile the unpacked Hex package:
 ```
 
 Record the commit, toolchain versions, package file lists, and archive checksums
-in `plans/release-0.1.0-audit.md`. `git status --short` must be empty.
+in the release's audit under `plans/`. `git status --short` must be empty.
 
 ## Tag
 
 Create an annotated tag on the commit that produced both packages:
 
 ```sh
-git tag -a v0.1.0 -m "Release VideoInterop 0.1.0"
+git tag -a v0.1.1 -m "Release VideoInterop 0.1.1"
 git push origin main
-git push origin v0.1.0
+git push origin v0.1.1
 ```
 
-Wait for every CI job on `v0.1.0` to pass. Do not publish from a different
+Wait for every CI job on `v0.1.1` to pass. Do not publish from a different
 checkout or commit.
 
 ## Publish the Rust crate through CI
 
-Pushing `v0.1.0` starts the normal CI matrix. The `publish-crate` job depends on
+Pushing `v0.1.1` starts the normal CI matrix. The `publish-crate` job depends on
 all validation jobs and the exact-tag gate, then waits for approval on the
 protected `crates-io` environment. Review the successful prerequisite jobs and
 approve that environment deployment. CI runs:
@@ -118,8 +118,8 @@ Do not run that command locally and do not upload a separately built archive.
 If the publish job fails before crates.io accepts the crate, fix the issue in a
 new commit and tag a new version; never move a public tag.
 
-After crates.io accepts 0.1.0, create a temporary crate that depends on
-`video-interop = "=0.1.0"`. Fetch it from crates.io and compile the default,
+After crates.io accepts 0.1.1, create a temporary crate that depends on
+`video-interop = "=0.1.1"`. Fetch it from crates.io and compile the default,
 core-only, EGL, and Vulkan feature sets. Stop if the registry archive differs
 from the tag.
 
@@ -146,13 +146,13 @@ Do not run those commands locally. After Hex accepts them, create a temporary
 Mix project with:
 
 ```elixir
-{:video_interop, "== 0.1.0"}
+{:video_interop, "== 0.1.1"}
 ```
 
 Fetch it from Hex, compile with warnings denied, and check the generated HexDocs
 source links.
 
-Create the GitHub release from `v0.1.0`. Include the supported Vulkan scope and
+Create the GitHub release from `v0.1.1`. Include the supported Vulkan scope and
 platform requirements.
 
 ## Update downstream projects

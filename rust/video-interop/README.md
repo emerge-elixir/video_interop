@@ -149,4 +149,4 @@ supported status.
 ## License
 
 Apache-2.0. See the
-[license](https://github.com/emerge-elixir/video_interop/blob/v0.1.0/rust/video-interop/LICENSE).
+[license](https://github.com/emerge-elixir/video_interop/blob/v0.1.1/rust/video-interop/LICENSE).

@@ -1,5 +1,8 @@
 # Plans
 
+- [`active-armv7-portability.md`](active-armv7-portability.md) — 0.1.1 ARMv7
+  DMA-BUF fix, registry publication, and downstream artifact qualification.
+
 - [`release-0.1.0-preparation.md`](release-0.1.0-preparation.md) — phased plan to fix all
   initial-release blockers, strengthen full Elixir/Rust CI, publish both artifacts, and migrate
   downstream projects to registry-only dependencies.

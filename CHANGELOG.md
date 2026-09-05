@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1 - 2026-09-05
+
+### Fixed
+
+- Fixed ARMv7 compilation of DMA-BUF probing by using 64-bit stat and seek
+  APIs for allocation sizes, file positions, and inode identities.
+- Added ARMv7 compile and Clippy checks to the release gate.
+
 ## 0.1.0 - 2026-09-03
 
 First public release.
