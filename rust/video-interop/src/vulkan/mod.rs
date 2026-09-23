@@ -150,6 +150,21 @@ pub trait VulkanDeviceContext: Send + Sync + 'static {
     /// Returns the family index of [`Self::queue`].
     fn queue_family_index(&self) -> u32;
 
+    /// Consumer timing policy; defaults preserve existing timestamp instrumentation.
+    /// This is not a physical-device capability and must remain fixed for a sync lane's lifetime.
+    fn video_gpu_timing_enabled(&self) -> bool {
+        true
+    }
+
+    /// Called once per eligible staged acquisition, not once per cached output slot.
+    /// The choice is retained through release. Queue/synchronization policy is unaffected.
+    fn sample_video_gpu_timing(&self) -> bool {
+        true
+    }
+
+    /// Optional instrumentation status: "ready", "unsupported" or "failed".
+    fn report_video_gpu_timing(&self, _status: &str) {}
+
     /// Submits through the renderer's single queue-host-access authority.
     ///
     /// Implementations must serialize this call with every other host access to the same queue,
