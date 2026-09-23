@@ -164,3 +164,9 @@ Off/unsampled paths preserve copies, ownership transfers, waits, release submiss
 and fences, including release command buffers with no timestamp commands. Results
 remain optional and are collected only after release completion. Unsupported timestamps
 and query-pool OOM omit instrumentation; device loss is never optional success.
+
+Existing consumers, including Emerge's Ganesh/headless renderer, do not need to
+implement the timing hooks: defaults enable timing for every supported staged frame
+and ignore status notifications. Direct imports remain untimed. This API has no
+Graphite dependency. Driver-free legacy-consumer tests cover these defaults,
+release-fence gating, and repeated sync-owner reuse.

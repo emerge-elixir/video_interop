@@ -297,6 +297,106 @@ impl VulkanDeviceContext for Context {
         self.lost.load(Ordering::Relaxed)
     }
 }
+// Models existing consumers such as Emerge's Ganesh/headless VulkanDevice: implement only
+// the original context contract, inheriting all three timing hooks rather than opting in.
+struct LegacyContext(Arc<Context>);
+impl VulkanDeviceContext for LegacyContext {
+    fn instance(&self) -> &ash::Instance {
+        self.0.instance()
+    }
+    fn device(&self) -> &ash::Device {
+        self.0.device()
+    }
+    fn physical_device(&self) -> vk::PhysicalDevice {
+        self.0.physical_device()
+    }
+    fn queue(&self) -> vk::Queue {
+        self.0.queue()
+    }
+    fn queue_family_index(&self) -> u32 {
+        self.0.queue_family_index()
+    }
+    unsafe fn submit_video_queue(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: vk::Fence,
+    ) -> Result<(), vk::Result> {
+        unsafe { self.0.submit_video_queue(submits, fence) }
+    }
+    fn mark_device_lost(&self) {
+        self.0.mark_device_lost();
+    }
+    fn is_device_lost(&self) -> bool {
+        self.0.is_device_lost()
+    }
+}
+
+#[test]
+fn legacy_consumer_defaults_time_every_staged_frame_after_release_fence() {
+    let ctx = Arc::new(LegacyContext(Context::new(false)));
+    ctx.0.sample.store(false, Ordering::Relaxed);
+    let mut lane = ImportedImageSync::new(Arc::clone(&ctx)).unwrap();
+    assert!(lane.has_gpu_timing_resources());
+    for _ in 0..3 {
+        lane.record_acquire(transfer()).unwrap();
+        record_staged_release(
+            ctx.as_ref(),
+            lane.release_command,
+            lane.active_timestamp_query(),
+        )
+        .unwrap();
+        lane.release_submitted = true;
+        let reads = trace().query_reads;
+        TRACE.with(|t| t.borrow_mut().fence_complete = false);
+        assert!(!lane.release_complete().unwrap());
+        assert_eq!(trace().query_reads, reads);
+        assert!(lane.take_timing().is_none());
+        assert!(lane.reset_for_reuse().is_err());
+        TRACE.with(|t| t.borrow_mut().fence_complete = true);
+        assert!(lane.release_complete().unwrap());
+        assert_eq!(
+            lane.take_timing(),
+            Some(VulkanVideoTiming {
+                conversion_ns: 10,
+                composition_ns: 20,
+                total_gpu_ns: 30,
+            })
+        );
+        assert!(lane.release_complete().unwrap());
+        assert_eq!(trace().query_reads, reads + 1);
+        assert!(lane.take_timing().is_none());
+        lane.reset_for_reuse().unwrap();
+    }
+    assert_eq!(trace().query_allocations, 1);
+    assert_eq!(trace().query_resets, 3);
+    assert_eq!(trace().writes, vec![0, 1, 2, 0, 1, 2, 0, 1, 2]);
+    assert_eq!(trace().copies, 6);
+    assert_eq!(trace().barriers, 9);
+    assert_eq!(ctx.0.choices.load(Ordering::Relaxed), 0);
+    assert!(ctx.0.status.lock().unwrap().is_empty());
+}
+
+#[test]
+fn legacy_consumer_direct_images_remain_untimed() {
+    let ctx = Arc::new(LegacyContext(Context::new(false)));
+    let mut lane = ImportedImageSync::new(Arc::clone(&ctx)).unwrap();
+    let image = vk::Image::from_raw(6);
+    lane.record_acquire(AcquirePlan::DirectImage { image })
+        .unwrap();
+    record_direct_release(ctx.as_ref(), lane.release_command, image).unwrap();
+    lane.release_submitted = true;
+    TRACE.with(|t| t.borrow_mut().fence_complete = false);
+    assert!(!lane.release_complete().unwrap());
+    TRACE.with(|t| t.borrow_mut().fence_complete = true);
+    assert!(lane.release_complete().unwrap());
+    assert!(lane.take_timing().is_none());
+    assert_eq!(trace().query_resets, 0);
+    assert_eq!(trace().query_reads, 0);
+    assert!(trace().writes.is_empty());
+    assert_eq!(trace().barriers, 2);
+    lane.reset_for_reuse().unwrap();
+}
+
 fn transfer() -> AcquirePlan {
     use super::super::ImportedPlane;
     AcquirePlan::StagedTransfer(StagedTransferPlan {
