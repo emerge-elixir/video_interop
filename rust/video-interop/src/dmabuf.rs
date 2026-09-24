@@ -7,6 +7,11 @@ use crate::{
     DmaBufAllocationSizeError, DuplicateError, Modifier, ValidationError, duplicate_fd_cloexec,
 };
 
+#[cfg(not(target_os = "linux"))]
+use libc::{fstat, lseek, stat as Stat};
+#[cfg(target_os = "linux")]
+use libc::{fstat64 as fstat, lseek64 as lseek, stat64 as Stat};
+
 pub const AV_DRM_MAX_ENTRIES: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,23 +32,22 @@ pub fn dmabuf_allocation_size(fd: RawFd) -> Result<u64, DmaBufAllocationSizeErro
 
 pub(crate) fn probe_dmabuf(fd: RawFd) -> Result<DmaBufProbe, DmaBufAllocationSizeError> {
     // Keep inode identities and file offsets 64-bit on 32-bit Linux too.
-    let mut stat = std::mem::MaybeUninit::<libc::stat64>::zeroed();
+    let mut stat = std::mem::MaybeUninit::<Stat>::zeroed();
     // SAFETY: `stat` points to writable storage and this call does not take ownership of `fd`.
-    if unsafe { libc::fstat64(fd, stat.as_mut_ptr()) } != 0 {
+    if unsafe { fstat(fd, stat.as_mut_ptr()) } != 0 {
         return Err(DmaBufAllocationSizeError::Stat(
             std::io::Error::last_os_error(),
         ));
     }
-    // SAFETY: fstat64 initialized the complete structure after returning success.
+    // SAFETY: fstat initialized the complete structure after returning success.
     let stat = unsafe { stat.assume_init() };
 
     // Linux DMA-BUF exporters expose their complete allocation through SEEK_END. Preserve the
     // shared file position when this fd also supports SEEK_CUR/SEEK_SET.
-    let original_position = unsafe { libc::lseek64(fd, 0, libc::SEEK_CUR) };
-    let allocation_end = unsafe { libc::lseek64(fd, 0, libc::SEEK_END) };
+    let original_position = unsafe { lseek(fd, 0, libc::SEEK_CUR) };
+    let allocation_end = unsafe { lseek(fd, 0, libc::SEEK_END) };
     let seek_error = (allocation_end < 0).then(std::io::Error::last_os_error);
-    if original_position >= 0 && unsafe { libc::lseek64(fd, original_position, libc::SEEK_SET) } < 0
-    {
+    if original_position >= 0 && unsafe { lseek(fd, original_position, libc::SEEK_SET) } < 0 {
         return Err(DmaBufAllocationSizeError::Restore(
             std::io::Error::last_os_error(),
         ));
@@ -71,7 +75,8 @@ pub(crate) fn probe_dmabuf(fd: RawFd) -> Result<DmaBufProbe, DmaBufAllocationSiz
     }
 
     Ok(DmaBufProbe {
-        device: stat.st_dev,
+        #[allow(clippy::unnecessary_cast)] // dev_t is signed 32-bit on macOS, u64 on Linux.
+        device: stat.st_dev as u64,
         inode: stat.st_ino,
         allocation_size,
     })
@@ -355,23 +360,35 @@ mod tests {
         unsafe { OwnedFd::from_raw_fd(raw) }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(not(target_os = "linux"))]
+    fn memfd(size: i64) -> OwnedFd {
+        let path = std::env::temp_dir().join("video-interop-size-XXXXXX");
+        let mut template = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .unwrap()
+            .into_bytes_with_nul();
+        let raw = unsafe { libc::mkstemp(template.as_mut_ptr().cast()) };
+        assert!(raw >= 0);
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        assert_eq!(unsafe { libc::unlink(template.as_ptr().cast()) }, 0);
+        assert_eq!(unsafe { libc::ftruncate(fd.as_raw_fd(), size) }, 0);
+        fd
+    }
+
     #[test]
     fn allocation_size_reports_complete_size_and_restores_position() {
         let fd = memfd(4_096);
         assert_eq!(
-            unsafe { libc::lseek64(fd.as_raw_fd(), 17, libc::SEEK_SET) },
+            unsafe { super::lseek(fd.as_raw_fd(), 17, libc::SEEK_SET) },
             17
         );
 
         assert_eq!(dmabuf_allocation_size(fd.as_raw_fd()).unwrap(), 4_096);
         assert_eq!(
-            unsafe { libc::lseek64(fd.as_raw_fd(), 0, libc::SEEK_CUR) },
+            unsafe { super::lseek(fd.as_raw_fd(), 0, libc::SEEK_CUR) },
             17
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn allocation_size_and_identity_preserve_large_file_values() {
         use std::os::unix::fs::MetadataExt;
@@ -381,14 +398,14 @@ mod tests {
         // ftruncate64 creates a sparse memfd; no multi-gigabyte buffer is allocated.
         let fd = memfd(size);
         assert_eq!(
-            unsafe { libc::lseek64(fd.as_raw_fd(), position, libc::SEEK_SET) },
+            unsafe { super::lseek(fd.as_raw_fd(), position, libc::SEEK_SET) },
             position
         );
 
         let probe = super::probe_dmabuf(fd.as_raw_fd()).unwrap();
         assert_eq!(probe.allocation_size, size as u64);
         assert_eq!(
-            unsafe { libc::lseek64(fd.as_raw_fd(), 0, libc::SEEK_CUR) },
+            unsafe { super::lseek(fd.as_raw_fd(), 0, libc::SEEK_CUR) },
             position
         );
 
@@ -397,7 +414,6 @@ mod tests {
         assert_eq!(probe.inode, metadata.ino());
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn allocation_size_rejects_zero_and_nonseekable_fds() {
         let empty = memfd(0);
@@ -406,15 +422,7 @@ mod tests {
             Err(DmaBufAllocationSizeError::Zero)
         ));
 
-        let mut pipe = [-1; 2];
-        assert_eq!(
-            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
-            0
-        );
-        // SAFETY: pipe2 returned two owned descriptors.
-        let read = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
-        // SAFETY: pipe2 returned two owned descriptors.
-        let _write = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+        let (read, _write) = std::os::unix::net::UnixStream::pair().unwrap();
         assert!(matches!(
             dmabuf_allocation_size(read.as_raw_fd()),
             Err(DmaBufAllocationSizeError::Seek(_))
@@ -423,15 +431,7 @@ mod tests {
 
     #[test]
     fn closes_earlier_duplicates_when_a_later_duplicate_fails() {
-        let mut pipe = [-1; 2];
-        assert_eq!(
-            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
-            0
-        );
-        // SAFETY: pipe2 returned two owned descriptors.
-        let read = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
-        // SAFETY: pipe2 returned two owned descriptors.
-        let write = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+        let (read, write) = std::os::unix::net::UnixStream::pair().unwrap();
 
         let descriptor = Descriptor {
             version: 1,
