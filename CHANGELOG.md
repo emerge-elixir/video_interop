@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.2 - 2026-09-24
+
+### Fixed
+
+- Fixed macOS compilation of video frame helpers while preserving 64-bit
+  DMA-BUF allocation sizes and inode identities on Linux, including ARMv7.
+- Made descriptor and dispatcher lifecycle tests portable to macOS.
+
 ## 0.1.1 - 2026-09-05
 
 ### Fixed
