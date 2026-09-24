@@ -141,7 +141,7 @@ defmodule VideoInterop.DispatcherLifecycleTest do
       VideoInterop.SchemaConsumerNative.start_dispatcher()
 
     producer = spawn(fn ->
-      {:ok, {producer_dispatcher, _producer_probe}} =
+      {:ok, {producer_dispatcher, producer_probe}} =
         VideoInterop.SchemaNative.start_dispatcher()
       {:ok, {fd, fd_resource}} = VideoInterop.SchemaNative.open_test_fd()
       token = make_ref()
@@ -188,6 +188,7 @@ defmodule VideoInterop.DispatcherLifecycleTest do
       {:ok, claim} =
         VideoInterop.SchemaConsumerNative.claim_frame(frame, consumer_dispatcher)
       {:ok, true} = VideoInterop.SchemaNative.shutdown_dispatcher(producer_dispatcher)
+      "stopped" = VideoInterop.SchemaNative.dispatcher_health(producer_probe)
       send(parent, {:foreign_claim, self(), claim, token, holder})
       _pin_complete_producer_terms_until_exit = {frame, fd_resource}
     end)
@@ -201,8 +202,11 @@ defmodule VideoInterop.DispatcherLifecycleTest do
           1_000 -> exit(:producer_down_timeout)
         end
 
-        if thread_alive?.("vi-schema-prod"), do: exit(:producer_dispatcher_not_joined)
-        unless thread_alive?.("vi-schema-cons"), do: exit(:consumer_dispatcher_not_alive)
+        "healthy" = VideoInterop.SchemaConsumerNative.dispatcher_health(consumer_probe)
+        if File.dir?("/proc/self/task") do
+          if thread_alive?.("vi-schema-prod"), do: exit(:producer_dispatcher_not_joined)
+          unless thread_alive?.("vi-schema-cons"), do: exit(:consumer_dispatcher_not_alive)
+        end
         unless :code.delete(VideoInterop.SchemaNative), do: exit(:producer_module_delete_failed)
         _purge_result = :code.purge(VideoInterop.SchemaNative)
         false = :code.is_loaded(VideoInterop.SchemaNative)

@@ -560,7 +560,7 @@ pub fn poll_sync_file(fence: &OwnedFd, timeout: Duration) -> SyncFilePollOutcome
 #[cfg(test)]
 mod tests {
     use std::{
-        os::fd::{AsRawFd, FromRawFd},
+        os::fd::AsRawFd,
         sync::{
             Mutex,
             atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering},
@@ -1080,9 +1080,7 @@ mod tests {
     }
 
     fn pipe() -> (OwnedFd, OwnedFd) {
-        let mut fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
-        // SAFETY: pipe2 returned fresh descriptors.
-        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+        let (read, write) = std::os::unix::net::UnixStream::pair().unwrap();
+        (read.into(), write.into())
     }
 }
