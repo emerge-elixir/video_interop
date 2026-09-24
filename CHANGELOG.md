@@ -2,11 +2,29 @@
 
 ## 0.1.2 - 2026-09-24
 
+### Added
+
+- Controls to disable existing Vulkan GPU timestamp instrumentation or sample
+  complete staged acquire-to-release intervals without changing synchronization.
+  Existing consumers keep staged-frame timing enabled by default.
+- Vulkan timing status notifications and
+  `ImportedImageSync::has_gpu_timing_resources` for diagnostics.
+- Driver-free regression tests for timing policies, release-fence gating,
+  sync-owner reuse, and backward compatibility with existing Vulkan consumers.
+
 ### Fixed
 
 - Fixed macOS compilation of video frame helpers while preserving 64-bit
   DMA-BUF allocation sizes and inode identities on Linux, including ARMv7.
-- Made descriptor and dispatcher lifecycle tests portable to macOS.
+- Made descriptor, EGL, and dispatcher lifecycle tests portable to macOS.
+- Prevented out-of-memory errors during Vulkan timestamp query-pool allocation
+  from failing synchronization setup. Query readback now omits timing samples
+  instead of failing release-completion polling on `NOT_READY` or out-of-memory
+  errors.
+- Disabled Vulkan timestamp instrumentation for non-finite or non-positive
+  timestamp periods and timestamp valid-bit counts greater than 64.
+- Correctly mark the Vulkan context as device-lost and return a device-loss error
+  when timestamp query-pool allocation or readback reports `ERROR_DEVICE_LOST`.
 
 ## 0.1.1 - 2026-09-05
 
