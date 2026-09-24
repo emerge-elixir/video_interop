@@ -111,6 +111,11 @@ pub struct ImportedImageSync<D: VulkanDeviceContext> {
 }
 
 impl<D: VulkanDeviceContext> ImportedImageSync<D> {
+    /// Whether this lane owns optional timestamp resources (not a completion signal).
+    pub fn has_gpu_timing_resources(&self) -> bool {
+        self.timestamp_query.is_some()
+    }
+
     pub fn new(device: Arc<D>) -> Result<Self, ImportedImageSyncError> {
         let acquire_pool =
             create_command_pool(device.as_ref(), "imported-image acquire").map_err(|error| {
@@ -160,7 +165,11 @@ impl<D: VulkanDeviceContext> ImportedImageSync<D> {
                     ));
                 }
             };
-            let timestamp_query = match create_timestamp_query(device.as_ref()) {
+            let timestamp_query = match if device.video_gpu_timing_enabled() {
+                create_timestamp_query(device.as_ref())
+            } else {
+                Ok(None)
+            } {
                 Ok(query) => query,
                 Err(error) => {
                     unsafe {
@@ -220,7 +229,6 @@ impl<D: VulkanDeviceContext> ImportedImageSync<D> {
                 "imported Vulkan image acquire was already submitted".to_string(),
             ));
         }
-        self.timing_active = imported.is_staged();
         let import_id = imported.import_id();
         let imported_acquire = acquire_sync_fd
             .map(|fd| {
@@ -306,7 +314,15 @@ impl<D: VulkanDeviceContext> ImportedImageSync<D> {
         }
     }
 
+    fn active_timestamp_query(&self) -> Option<&TimestampQuery> {
+        self.timestamp_query.as_ref().filter(|_| self.timing_active)
+    }
+
     fn record_acquire(&mut self, plan: AcquirePlan) -> Result<(), String> {
+        // Choose once for the entire acquire-to-release bracket, never on release or reuse.
+        self.timing_active = !matches!(plan, AcquirePlan::DirectImage { .. })
+            && self.timestamp_query.is_some()
+            && self.device.sample_video_gpu_timing();
         unsafe {
             self.device
                 .device()
@@ -321,19 +337,19 @@ impl<D: VulkanDeviceContext> ImportedImageSync<D> {
                 self.device.as_ref(),
                 self.acquire_command,
                 plan,
-                self.timestamp_query.as_ref(),
+                self.active_timestamp_query(),
             ),
             AcquirePlan::StagedTransfer(plan) => record_staged_transfer_acquire(
                 self.device.as_ref(),
                 self.acquire_command,
                 plan,
-                self.timestamp_query.as_ref(),
+                self.active_timestamp_query(),
             ),
             AcquirePlan::StagedImageTransfer(plan) => record_staged_image_transfer_acquire(
                 self.device.as_ref(),
                 self.acquire_command,
                 plan,
-                self.timestamp_query.as_ref(),
+                self.active_timestamp_query(),
             ),
         }
     }
@@ -437,7 +453,7 @@ impl<D: VulkanDeviceContext> ImportedImageSync<D> {
             record_staged_release(
                 self.device.as_ref(),
                 self.release_command,
-                self.timestamp_query.as_ref(),
+                self.active_timestamp_query(),
             )
         } else {
             record_direct_release(self.device.as_ref(), self.release_command, imported.image())
@@ -543,20 +559,38 @@ impl<D: VulkanDeviceContext> ImportedImageSync<D> {
             return Ok(());
         };
         let mut values = [0_u64; 3];
-        unsafe {
+        match unsafe {
             self.device.device().get_query_pool_results(
                 query.pool,
                 0,
                 &mut values,
                 vk::QueryResultFlags::TYPE_64,
             )
+        } {
+            Ok(()) => {}
+            Err(
+                vk::Result::NOT_READY
+                | vk::Result::ERROR_OUT_OF_HOST_MEMORY
+                | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            ) => {
+                // Called only after the release fence signaled; timing failure is not ownership failure.
+                self.device.report_video_gpu_timing("failed");
+                return Ok(());
+            }
+            Err(result) => {
+                if result == vk::Result::ERROR_DEVICE_LOST {
+                    self.device.mark_device_lost();
+                    return Err(ImportedImageSyncError::device_lost(
+                        ImportedImageSyncErrorKind::ReleaseFencePoll,
+                        "Vulkan device lost while reading video timestamps".into(),
+                    ));
+                }
+                return Err(ImportedImageSyncError::new(
+                    ImportedImageSyncErrorKind::ReleaseFencePoll,
+                    format!("failed to read Vulkan video timestamps: {result:?}"),
+                ));
+            }
         }
-        .map_err(|result| {
-            ImportedImageSyncError::new(
-                ImportedImageSyncErrorKind::ReleaseFencePoll,
-                format!("failed to read Vulkan video timestamps: {result:?}"),
-            )
-        })?;
         let ticks = |start: u64, end: u64| timestamp_delta(start, end, query.valid_bits);
         let to_ns = |ticks: u64| (ticks as f64 * query.period_ns).round() as u64;
         let sample = VulkanVideoTiming {
@@ -658,26 +692,43 @@ fn create_timestamp_query<D: VulkanDeviceContext>(
         .get(usize::try_from(device.queue_family_index()).unwrap_or(usize::MAX))
         .map(|properties| properties.timestamp_valid_bits)
         .unwrap_or(0);
-    if valid_bits == 0 {
-        return Ok(None);
-    }
-    let info = vk::QueryPoolCreateInfo::default()
-        .query_type(vk::QueryType::TIMESTAMP)
-        .query_count(3);
-    let pool = unsafe { device.device().create_query_pool(&info, None) }.map_err(|result| {
-        ImportedImageSyncError::new(
-            ImportedImageSyncErrorKind::Other,
-            format!("failed to create Vulkan video timestamp pool: {result:?}"),
-        )
-    })?;
     let properties = unsafe {
         device
             .instance()
             .get_physical_device_properties(device.physical_device())
     };
+    let period = properties.limits.timestamp_period;
+    if valid_bits == 0 || valid_bits > 64 || !period.is_finite() || period <= 0.0 {
+        device.report_video_gpu_timing("unsupported");
+        return Ok(None);
+    }
+    let info = vk::QueryPoolCreateInfo::default()
+        .query_type(vk::QueryType::TIMESTAMP)
+        .query_count(3);
+    let pool = match unsafe { device.device().create_query_pool(&info, None) } {
+        Ok(pool) => pool,
+        Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY) => {
+            device.report_video_gpu_timing("failed");
+            return Ok(None);
+        }
+        Err(result) => {
+            if result == vk::Result::ERROR_DEVICE_LOST {
+                device.mark_device_lost();
+                return Err(ImportedImageSyncError::device_lost(
+                    ImportedImageSyncErrorKind::Other,
+                    format!("failed to create Vulkan video timestamp pool: {result:?}"),
+                ));
+            }
+            return Err(ImportedImageSyncError::new(
+                ImportedImageSyncErrorKind::Other,
+                format!("failed to create Vulkan video timestamp pool: {result:?}"),
+            ));
+        }
+    };
+    device.report_video_gpu_timing("ready");
     Ok(Some(TimestampQuery {
         pool,
-        period_ns: f64::from(properties.limits.timestamp_period),
+        period_ns: f64::from(period),
         valid_bits,
     }))
 }
@@ -1430,3 +1481,7 @@ mod tests {
         assert_eq!(timestamp_delta(250, 5, 8), 11);
     }
 }
+
+#[cfg(test)]
+#[path = "sync_timing_tests.rs"]
+mod timing_tests;

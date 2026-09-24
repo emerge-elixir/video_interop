@@ -150,3 +150,23 @@ supported status.
 
 Apache-2.0. See the
 [license](https://github.com/emerge-elixir/video_interop/blob/v0.1.2/rust/video-interop/LICENSE).
+
+## Optional Vulkan GPU timing
+
+Consumers can override `VulkanDeviceContext::video_gpu_timing_enabled` to omit
+query-pool allocation and `sample_video_gpu_timing` to select an entire staged
+acquire-to-release bracket. Defaults retain existing instrumentation. Keep the enable
+policy fixed for sync-owner lifetimes and make sampling independent of cached slot
+indices. `report_video_gpu_timing` receives resource status; timing is not a capability
+or completion authority. `ImportedImageSync::has_gpu_timing_resources` supports diagnostics.
+
+Off/unsampled paths preserve copies, ownership transfers, waits, release submissions
+and fences, including release command buffers with no timestamp commands. Results
+remain optional and are collected only after release completion. Unsupported timestamps
+and query-pool OOM omit instrumentation; device loss is never optional success.
+
+Existing consumers, including Emerge's Ganesh/headless renderer, do not need to
+implement the timing hooks: defaults enable timing for every supported staged frame
+and ignore status notifications. Direct imports remain untimed. This API has no
+Graphite dependency. Driver-free legacy-consumer tests cover these defaults,
+release-fence gating, and repeated sync-owner reuse.
