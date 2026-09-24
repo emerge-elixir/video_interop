@@ -59,7 +59,7 @@ Add the Hex package to your dependencies:
 ```elixir
 def deps do
   [
-    {:video_interop, "~> 0.1.1"}
+    {:video_interop, "~> 0.1.2"}
   ]
 end
 ```
