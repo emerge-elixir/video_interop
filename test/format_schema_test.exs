@@ -36,6 +36,7 @@ defmodule VideoInterop.FormatSchemaTest do
   test "round-trips binary storage formats" do
     for storage <- [
           %Binary.Format{pixel_format: :rgba8888},
+          %Binary.Format{pixel_format: :bgra8888},
           %Binary.Format{pixel_format: :rgb888},
           %Binary.Format{pixel_format: :gray8},
           %Binary.Format{pixel_format: :gray2},

@@ -250,7 +250,10 @@ defmodule VideoInterop.Validator do
 
   defp storage_acquire_sync(%DMABufFormat{}, _policy), do: :ok
 
-  defp storage_alpha_mode(%Binary.Format{pixel_format: :rgba8888}, _alpha_mode), do: :ok
+  defp storage_alpha_mode(%Binary.Format{pixel_format: format}, _alpha_mode)
+       when format in [:rgba8888, :bgra8888],
+       do: :ok
+
   defp storage_alpha_mode(%Binary.Format{}, :opaque), do: :ok
 
   defp storage_alpha_mode(%Binary.Format{}, alpha_mode),
@@ -375,7 +378,8 @@ defmodule VideoInterop.Validator do
     do: {:error, {:unsupported_binary_planes, planes}}
 
   defp binary_format(%Binary.Format{pixel_format: pixel_format, bw1_polarity: polarity})
-       when pixel_format in [:rgba8888, :rgb888, :gray8, :gray2] and is_nil(polarity),
+       when pixel_format in [:rgba8888, :bgra8888, :rgb888, :gray8, :gray2] and
+              is_nil(polarity),
        do: :ok
 
   defp binary_format(%Binary.Format{pixel_format: :bw1, bw1_polarity: polarity})
@@ -384,7 +388,9 @@ defmodule VideoInterop.Validator do
 
   defp binary_format(format), do: {:error, {:invalid_binary_format, format}}
 
-  defp binary_minimum_stride(width, :rgba8888), do: checked_stride(width, 4)
+  defp binary_minimum_stride(width, format) when format in [:rgba8888, :bgra8888],
+    do: checked_stride(width, 4)
+
   defp binary_minimum_stride(width, :rgb888), do: checked_stride(width, 3)
   defp binary_minimum_stride(width, :gray8), do: checked_stride(width, 1)
   defp binary_minimum_stride(width, :gray2), do: {:ok, div(width + 3, 4)}
