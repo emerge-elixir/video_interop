@@ -169,6 +169,8 @@ impl Default for Colorimetry {
 #[cfg_attr(feature = "rustler", derive(rustler::NifUnitEnum))]
 pub enum BinaryPixelFormat {
     Rgba8888,
+    /// B, G, R, A byte order; little-endian DRM ARGB8888/XRGB8888.
+    Bgra8888,
     Rgb888,
     Gray8,
     Gray2,
@@ -276,8 +278,10 @@ impl Format {
             if self.acquire_sync != AcquireSyncPolicy::Implicit {
                 return Err(FormatValidationError::BinaryFormatRequiresImplicitSync);
             }
-            if storage.pixel_format != BinaryPixelFormat::Rgba8888
-                && self.alpha_mode != AlphaMode::Opaque
+            if !matches!(
+                storage.pixel_format,
+                BinaryPixelFormat::Rgba8888 | BinaryPixelFormat::Bgra8888
+            ) && self.alpha_mode != AlphaMode::Opaque
             {
                 return Err(FormatValidationError::BinaryFormatRequiresOpaqueAlpha);
             }

@@ -65,7 +65,10 @@ defmodule VideoInterop.Frame do
     end
   end
 
-  defp minimum_stride!(width, :rgba8888) when is_integer(width) and width > 0, do: width * 4
+  defp minimum_stride!(width, format)
+       when format in [:rgba8888, :bgra8888] and is_integer(width) and width > 0,
+       do: width * 4
+
   defp minimum_stride!(width, :rgb888) when is_integer(width) and width > 0, do: width * 3
   defp minimum_stride!(width, :gray8) when is_integer(width) and width > 0, do: width
   defp minimum_stride!(width, :gray2) when is_integer(width) and width > 0, do: div(width + 3, 4)
@@ -76,6 +79,6 @@ defmodule VideoInterop.Frame do
           "unsupported binary pixel format or width: #{inspect({pixel_format, width})}"
   end
 
-  defp default_alpha_mode(:rgba8888), do: :premultiplied
+  defp default_alpha_mode(format) when format in [:rgba8888, :bgra8888], do: :premultiplied
   defp default_alpha_mode(_pixel_format), do: :opaque
 end

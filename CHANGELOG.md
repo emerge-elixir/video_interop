@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `:bgra8888` binary pixel format (B, G, R, A byte order, premultiplied by
+  default) for producers and consumers that target little-endian DRM
+  `ARGB8888`/`XRGB8888` scanout buffers without a per-frame channel swap.
+
 ## 0.1.2 - 2026-09-24
 
 ### Added

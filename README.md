@@ -42,7 +42,7 @@ select an application transport.
 
 ## Project status
 
-Version 0.1 supports owned RGBA8888, RGB888, Gray8, Gray2, and BW1 binaries,
+Version 0.1 supports owned RGBA8888, BGRA8888, RGB888, Gray8, Gray2, and BW1 binaries,
 plus Linux DMA-BUF frames and sync-file acquire fences.
 
 The frame, binary, DMA-BUF, validation, lease, Rustler, EGL, and Vulkan APIs are

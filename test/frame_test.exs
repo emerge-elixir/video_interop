@@ -27,6 +27,19 @@ defmodule VideoInterop.FrameTest do
     assert :ok = VideoInterop.release(frame)
   end
 
+  test "validates a premultiplied BGRA8888 binary frame" do
+    frame =
+      Frame.binary(<<1, 2, 3, 255, 4, 5, 6, 255>>, width: 2, height: 1, pixel_format: :bgra8888)
+
+    assert :ok = VideoInterop.validate(frame)
+    assert frame.format.alpha_mode == :premultiplied
+    assert %Binary{planes: [%Binary.Plane{stride: 8}]} = frame.storage
+
+    assert_raise ArgumentError, fn ->
+      Frame.binary(<<1, 2, 3, 255>>, width: 2, height: 1, pixel_format: :bgra8888)
+    end
+  end
+
   test "validates packed grayscale polarity and row stride" do
     assert :ok =
              VideoInterop.validate(
