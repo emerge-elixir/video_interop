@@ -160,6 +160,9 @@ jobs:
     name: Publish video-interop to crates.io
     if: github.repository == 'emerge-elixir/video_interop' && startsWith(github.ref, 'refs/tags/v')
     needs: [release-tag]
+    permissions:
+      contents: read
+      id-token: write
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: crates-io
@@ -169,9 +172,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.91.0
+      - name: Authenticate with crates.io
+        id: crates-auth
+        uses: rust-lang/crates-io-auth-action@v1
       - name: Publish tagged crate
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
         run: cargo publish --locked --package video-interop
 
   publish-hex:
